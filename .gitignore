@@ -1,0 +1,6 @@
+/target
+/jnisafe-annotations/target
+/build
+/.pixi
+/.claude/settings.local.json
+# Commit pixi.lock for reproducible builds — do not ignore it.

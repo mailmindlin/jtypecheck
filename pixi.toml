@@ -1,0 +1,99 @@
+# Pixi manifest for jtypecheck — a Rust-primary workspace with a Java side-build.
+#
+# Pixi pins the toolchain (Rust + JDK) so builds are reproducible across
+# machines/CI, and defines the tasks that tie the Cargo build to the `javac`
+# steps that produce the annotations JAR and the test fixtures.
+#
+# Quick start:
+#   pixi install          # fetch the pinned toolchain into ./.pixi
+#   pixi run build        # cargo build + annotations JAR
+#   pixi run test         # regenerate fixtures, then cargo test
+#   pixi run demo         # run the checker against the example crate
+#   pixi run check-jni -- --rust-crate <crate> --java <class|dir|jar> ...
+
+[workspace]
+name = "jtypecheck"
+description = "JNI safety checker: validate that a Rust/Java JNI layer agrees on names, signatures, and pointer types."
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64", "win-64"]
+
+[dependencies]
+rust = ">=1.89"
+openjdk = ">=11"
+# Only to publish jnisafe-annotations to Maven Central (publish-annotations)
+maven = ">=3.9"
+
+# --- Java side-build -------------------------------------------------------
+
+# Compile the annotation sources (incl. module-info) into a classes dir that is
+# reused both for the JAR artifact and as the classpath when compiling examples.
+[tasks.compile-annotations]
+cmd = "javac -d build/annotations/classes jnisafe-annotations/module-info.java jnisafe-annotations/io/github/mailmindlin/jnisafe/*.java"
+inputs = ["jnisafe-annotations/**/*.java"]
+outputs = ["build/annotations/classes/**/*.class"]
+
+# Package the compiled annotations into a distributable modular JAR.
+[tasks.jar]
+cmd = "jar --create --file build/jnisafe-annotations.jar -C build/annotations/classes ."
+depends-on = ["compile-annotations"]
+inputs = ["build/annotations/classes/**/*.class"]
+outputs = ["build/jnisafe-annotations.jar"]
+
+# Build the annotations via Maven incl. the sources + javadoc jars, without
+# signing — a local sanity check that the publish artifacts assemble correctly.
+[tasks.package-annotations]
+cmd = "mvn -B -f jnisafe-annotations/pom.xml clean package"
+
+# Publish the annotations to Maven Central. Requires a GPG key plus a settings.xml
+# with the `central` server credentials (see .github/workflows/release-annotations.yml
+# for the CI form). Run locally only if your environment is configured for it.
+[tasks.publish-annotations]
+cmd = "mvn -B -f jnisafe-annotations/pom.xml -Prelease clean deploy"
+
+# Regenerate the committed `.class` test fixtures consumed by the Rust e2e tests
+# (see jnisafe-check/tests/e2e.rs). Run this whenever the example Java changes.
+[tasks.fixtures]
+cmd = "javac -cp build/annotations/classes -d jnisafe-check/tests/fixtures/classes example/java/example/*.java"
+depends-on = ["compile-annotations"]
+inputs = ["example/java/example/*.java", "build/annotations/classes/**/*.class"]
+outputs = ["jnisafe-check/tests/fixtures/classes/example/*.class"]
+
+# Compile the example Java into a throwaway classes dir for the `demo` task.
+[tasks.compile-example]
+cmd = "javac -cp build/annotations/classes -d build/example/classes example/java/example/*.java"
+depends-on = ["compile-annotations"]
+inputs = ["example/java/example/*.java", "build/annotations/classes/**/*.class"]
+outputs = ["build/example/classes/**/*.class"]
+
+# --- Rust build / test / run ----------------------------------------------
+
+# Full build: the Rust workspace plus the annotations JAR.
+[tasks.build]
+cmd = "cargo build --workspace"
+depends-on = ["jar"]
+
+# Tests regenerate fixtures first so Java source changes are reflected.
+[tasks.test]
+cmd = "cargo test --workspace"
+depends-on = ["fixtures"]
+
+# Run the checker CLI; forward args, e.g.
+#   pixi run check-jni -- --rust-crate example/rust --java build/example/classes
+[tasks.check-jni]
+cmd = "cargo run -p jnisafe-check --"
+
+# End-to-end demo: build example Java classes and check them against example/rust.
+[tasks.demo]
+cmd = "cargo run -p jnisafe-check -- --rust-crate example/rust --java build/example/classes/example/Correct.class"
+depends-on = ["compile-example"]
+
+# --- Quality / housekeeping -------------------------------------------------
+
+[tasks.fmt]
+cmd = "cargo fmt --all"
+
+[tasks.lint]
+cmd = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.clean]
+cmd = "cargo clean && rm -rf build"

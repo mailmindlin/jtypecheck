@@ -1,0 +1,40 @@
+name: Release crates
+
+# Manual publish to crates.io. Pick the crate to release; the workflow builds,
+# tests, and `cargo publish`es it. Requires a CARGO_REGISTRY_TOKEN repo secret
+# (Settings → Secrets and variables → Actions). Note: each crate's Cargo.toml
+# must carry `description`, `license`, and `repository` before crates.io will
+# accept it.
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: Crate to publish
+        required: true
+        type: choice
+        options:
+          - jnisafe
+          - jnisafe-check
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pixi (pinned toolchain)
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.66.0
+          cache: true
+
+      - name: Test
+        run: pixi run test
+
+      - name: Publish ${{ inputs.crate }}
+        run: pixi run cargo publish -p ${{ inputs.crate }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

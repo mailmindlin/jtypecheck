@@ -1,0 +1,37 @@
+name: Release annotations
+
+# Manual publish of jnisafe-annotations to Maven Central (Sonatype Central Portal).
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   MAVEN_CENTRAL_USERNAME / MAVEN_CENTRAL_PASSWORD  — a Central Portal user token
+#   GPG_PRIVATE_KEY                                  — ASCII-armored private key
+#   MAVEN_GPG_PASSPHRASE                             — that key's passphrase
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup-java wires up settings.xml (server id `central`) and imports the GPG key.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Deploy to Maven Central
+        run: mvn -B -f jnisafe-annotations/pom.xml -Prelease clean deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}

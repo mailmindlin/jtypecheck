@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!--
+    This POM exists ONLY to publish the annotations to Maven Central. Day-to-day
+    development builds the jar with plain javac/jar via `pixi run jar`.
+
+    The Java package (io.github.mailmindlin.jnisafe) sits under the same root as
+    the Maven groupId (io.github.mailmindlin), though Maven does not require that.
+
+    Local check:   pixi run package-annotations      (build + sources + javadoc)
+    Publish:       pixi run publish-annotations       (adds GPG signing + deploy)
+  -->
+
+  <groupId>io.github.mailmindlin</groupId>
+  <artifactId>jnisafe-annotations</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <name>jnisafe-annotations</name>
+  <description>Annotations (@Owned, @Ref, @Mut, @Ignore) marking JNI pointer ownership for jnisafe-check.</description>
+  <url>https://github.com/mailmindlin/jtypecheck</url>
+
+  <licenses>
+    <license>
+      <name>MIT</name>
+      <url>https://opensource.org/licenses/MIT</url>
+    </license>
+    <license>
+      <name>Apache-2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>mailmindlin</id>
+      <name>Liam Feehery</name>
+      <url>https://github.com/mailmindlin</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/mailmindlin/jtypecheck.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/mailmindlin/jtypecheck.git</developerConnection>
+    <url>https://github.com/mailmindlin/jtypecheck</url>
+  </scm>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.release>11</maven.compiler.release>
+  </properties>
+
+  <build>
+    <!-- Sources live at the module root (module-info.java + io/github/mailmindlin/jnisafe/*.java),
+         not in the Maven-standard src/main/java, so point the compiler here. -->
+    <sourceDirectory>${project.basedir}</sourceDirectory>
+    <plugins>
+      <!-- Attach the sources jar (required by Maven Central). -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-source-plugin</artifactId>
+        <version>3.3.1</version>
+        <executions>
+          <execution>
+            <id>attach-sources</id>
+            <goals><goal>jar-no-fork</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- Attach the javadoc jar (required by Maven Central). -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <version>3.11.2</version>
+        <executions>
+          <execution>
+            <id>attach-javadocs</id>
+            <goals><goal>jar</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- Signing + Central deploy are only needed when publishing, so they live in
+         a profile. `package` (no profile) works locally without a GPG key. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <!-- GPG-sign all artifacts (required by Maven Central). -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Upload to the Sonatype Central Portal. Reads credentials from the
+               `central` server entry in settings.xml (see release workflow). -->
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.6.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>
