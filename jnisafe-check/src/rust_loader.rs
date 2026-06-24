@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use quote::ToTokens;
 use syn::{FnArg, GenericArgument, Item, PathArguments, ReturnType, Type};
 
-use crate::ir::{IrType, MethodKey, Origin, Pointer, PointerKind, Receiver, Signature, SrcLoc};
+use crate::ir::{
+    IrType, MethodKey, Origin, Pointer, PointerKind, Receiver, RustExportProblem, Signature, SrcLoc,
+};
 use crate::typemap;
 
 #[derive(Debug, thiserror::Error)]
@@ -72,9 +74,6 @@ fn lower_fn(f: &syn::ItemFn, path: &Path) -> Option<Signature> {
     if !ident.starts_with("Java_") {
         return None;
     }
-    if !is_no_mangle(&f.attrs) || !is_system_abi(&f.sig.abi) {
-        return None;
-    }
 
     // Inputs: skip the JNIEnv and the receiver (JClass / JObject), but read the
     // receiver type so we can cross-check static-vs-instance against Java.
@@ -87,6 +86,18 @@ fn lower_fn(f: &syn::ItemFn, path: &Path) -> Option<Signature> {
             FnArg::Receiver(_) => None,
         })
         .collect();
+
+    // A `Java_*`-named fn is meant to be an export; lower it even when it isn't
+    // a valid one so the checker can flag the mistake (W002 / E004) instead of
+    // silently dropping it.
+    let export_problem = if !is_no_mangle(&f.attrs) || !is_system_abi(&f.sig.abi) {
+        Some(RustExportProblem::NotExported)
+    } else if inputs.len() < 2 {
+        // No room for the JNIEnv + receiver that every JNI entry point needs.
+        Some(RustExportProblem::TooFewParams)
+    } else {
+        None
+    };
 
     let receiver = inputs
         .get(1)
@@ -116,6 +127,7 @@ fn lower_fn(f: &syn::ItemFn, path: &Path) -> Option<Signature> {
             }),
             java: None,
         },
+        export_problem,
     })
 }
 
