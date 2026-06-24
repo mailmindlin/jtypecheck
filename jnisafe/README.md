@@ -27,6 +27,35 @@ fn read(ptr: JRef<'_, Box<String>>) -> usize {
 }
 ```
 
+## Runtime validation (debug builds)
+
+The static checker only sees signatures; it can't know *which* handle Java
+passes at runtime. In **debug builds** (`debug_assertions`), `jnisafe` keeps a
+side table of every live handle and validates it on use, catching bugs the
+checker can't:
+
+- a **wrong-type** handle (Java passed a `Box<Foo>` where a `Box<Bar>` was expected),
+- a **use-after-free** / **double-free** (a handle used or dropped after it was freed),
+- a **bogus or misaligned** `long` that never came from a `jnisafe` handle.
+
+On a violation it prints a diagnostic and panics; inside a JNI call the jni
+`with_env` glue surfaces that as a Java `Throwable` with a stack trace. For
+**mutable aliasing**, use the checked `borrow_mut()` path:
+
+```rust
+let mut guard = ptr.borrow_mut();   // JMut / JOwned
+*guard = new_value;                 // two concurrent borrow_mut() of one object panic in debug
+```
+
+This is **completely compiled out in release** — the wrappers stay
+`#[repr(transparent)]` over a `jlong` with zero added cost. To harden a release
+build, opt in per package: `[profile.release.package.jnisafe] debug-assertions = true`.
+
+**Limits:** plain `*ptr = x` via `DerefMut` (and shared-vs-mutable aliasing)
+stay unchecked — only `borrow_mut()` guards each other; and a freed address that
+the allocator immediately reuses for a *new object of the same type* (ABA) can
+slip past the address-keyed table.
+
 Pair this with the [`jnisafe-annotations`] Java annotations and the
 [`jnisafe-check`] static checker to verify the Rust and Java sides agree before
 they fail at runtime. See the [project README] for the full workflow.
