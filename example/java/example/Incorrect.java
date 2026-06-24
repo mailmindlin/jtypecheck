@@ -37,4 +37,11 @@ public class Incorrect {
 
     // E002: instance (non-static) method, but Rust takes JClass.
     private native void recvMismatch();
+
+    // E026: pointer annotation on an `int` slot (a 64-bit handle can't fit).
+    private static native void badSlot(@Ref("Box<String>") int handle);
+
+    // W003: Rust returns a borrow handle (JRef). nullable=false so the only
+    // finding is the borrow-return warning, not an E03x type/nullability error.
+    private static native @Ref(value = "Box<String>", nullable = false) long borrowReturn();
 }

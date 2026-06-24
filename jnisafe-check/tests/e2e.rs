@@ -59,7 +59,8 @@ fn incorrect_reports_one_diagnostic_per_case() {
     let report = run(&cfg).expect("run");
 
     for code in [
-        "E001", "E023", "E024", "E025", "E020", "E021", "E010", "E002", "W001",
+        "E001", "E023", "E024", "E025", "E020", "E021", "E010", "E002", "W001", "E026", "E004",
+        "W002", "W003",
     ] {
         assert!(
             report.has_code(code),
@@ -68,8 +69,8 @@ fn incorrect_reports_one_diagnostic_per_case() {
         );
     }
     assert!(report.has_errors());
-    assert_eq!(report.error_count(), 8);
-    assert_eq!(report.warning_count(), 1);
+    assert_eq!(report.error_count(), 10);
+    assert_eq!(report.warning_count(), 3);
 }
 
 #[test]

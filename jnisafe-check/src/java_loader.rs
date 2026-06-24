@@ -124,6 +124,7 @@ fn load_class(bytes: &[u8], source: &str, out: &mut Vec<Signature>) -> Result<()
                     descriptor: full_descriptor(&m.descriptor),
                 }),
             },
+            export_problem: None,
         });
     }
     Ok(())
@@ -235,20 +236,43 @@ fn lower_return(desc: &MethodDescriptor, ret_ann: &Option<PtrAnn>) -> IrType {
 }
 
 /// Build a `Pointer` IR, validating that the annotated slot is a bare `long`.
+/// An annotation on anything else becomes `Misannotated` (E026).
 fn pointer_ir(fd: &FieldDescriptor, ann: &PtrAnn) -> IrType {
     let is_long = fd.dimensions == 0 && matches!(fd.field_type, FieldType::Long);
     if !is_long {
-        return IrType::Unsupported(format!(
-            "{} annotation on non-`long` ({})",
-            ann.kind.annotation(),
-            fd
-        ));
+        let narrow_int = fd.dimensions == 0
+            && matches!(
+                fd.field_type,
+                FieldType::Integer | FieldType::Short | FieldType::Byte | FieldType::Char
+            );
+        return IrType::Misannotated {
+            ann_kind: ann.kind,
+            java_desc: java_type_name(fd),
+            narrow_int,
+        };
     }
     IrType::Pointer(Pointer {
         kind: ann.kind,
         rust_type: ann.rust_type.clone(),
         nullable: ann.nullable,
     })
+}
+
+/// Human-readable Java type for a field descriptor, e.g. `int`,
+/// `java.lang.String`, `long[]` (for diagnostics — not the raw JVM descriptor).
+fn java_type_name(fd: &FieldDescriptor) -> String {
+    let base = match &fd.field_type {
+        FieldType::Boolean => "boolean".to_owned(),
+        FieldType::Byte => "byte".to_owned(),
+        FieldType::Char => "char".to_owned(),
+        FieldType::Short => "short".to_owned(),
+        FieldType::Integer => "int".to_owned(),
+        FieldType::Long => "long".to_owned(),
+        FieldType::Float => "float".to_owned(),
+        FieldType::Double => "double".to_owned(),
+        FieldType::Object(cn) => cn.to_string().replace('/', "."),
+    };
+    format!("{base}{}", "[]".repeat(fd.dimensions as usize))
 }
 
 fn java_field_to_ir(fd: &FieldDescriptor) -> IrType {

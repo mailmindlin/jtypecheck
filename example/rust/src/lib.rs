@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use jni::{
     EnvUnowned,
     errors::{Error, ThrowRuntimeExAndDefault},
@@ -51,14 +53,17 @@ pub extern "system" fn Java_example_Correct_set<'local>(
     value: JString<'local>,
 ) {
     env.with_env(|env| -> Result<_, Error> {
-        let ptr: &mut String = &mut ptr;
+        // `borrow_mut()` is the checked mutable-access path: in debug builds a
+        // second concurrent mutable borrow of the same object is detected.
+        let mut guard = ptr.borrow_mut();
+        let s: &mut String = &mut guard;
         match value.mutf8_chars(env)?.to_str() {
-            std::borrow::Cow::Borrowed(value) => {
-                ptr.clear();
-                ptr.push_str(value);
+            Cow::Borrowed(value) => {
+                s.clear();
+                s.push_str(value);
             }
-            std::borrow::Cow::Owned(value) => {
-                *ptr = value;
+            Cow::Owned(value) => {
+                *s = value;
             }
         }
         Ok(())

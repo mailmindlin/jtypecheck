@@ -72,6 +72,16 @@ pub enum IrType {
         class: String,
     },
     Pointer(Pointer),
+    /// A pointer annotation (`@Ref`/`@Mut`/`@Owned`) placed on a slot that is
+    /// not a bare `long` — the handle cannot live there. `java_desc` is the
+    /// human-readable Java type of the slot (e.g. `int`, `java.lang.String`);
+    /// `narrow_int` is `true` for integer slots narrower than `long`
+    /// (`int`/`short`/`byte`/`char`), which would truncate the address.
+    Misannotated {
+        ann_kind: PointerKind,
+        java_desc: String,
+        narrow_int: bool,
+    },
     /// A type the loader recognised syntactically but cannot map yet.
     Unsupported(String),
 }
@@ -87,9 +97,25 @@ impl IrType {
                 let null = if p.nullable { ", nullable" } else { "" };
                 format!("{}({}{})", p.kind.annotation(), p.rust_type, null)
             }
+            IrType::Misannotated {
+                ann_kind,
+                java_desc,
+                ..
+            } => format!("{} on non-`long` ({java_desc})", ann_kind.annotation()),
             IrType::Unsupported(s) => format!("unsupported({s})"),
         }
     }
+}
+
+/// A structural problem with a Rust `Java_*` function that stops it from being
+/// a valid JNI export. Discovered by the Rust loader, reported by the checker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RustExportProblem {
+    /// Named `Java_*` but missing `#[no_mangle]` / not `extern "system"`/`"C"`.
+    NotExported,
+    /// Fewer than two leading parameters (no room for `JNIEnv` + receiver).
+    TooFewParams,
 }
 
 /// What the Rust function takes as its second argument (the JNI receiver).
@@ -145,4 +171,8 @@ pub struct Signature {
     pub params: Vec<IrType>,
     pub ret: IrType,
     pub origin: Origin,
+    /// Set by the Rust loader when a `Java_*` fn is structurally not a valid
+    /// export; always `None` for Java signatures and well-formed Rust exports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub export_problem: Option<RustExportProblem>,
 }

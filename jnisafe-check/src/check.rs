@@ -4,15 +4,21 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, Report};
-use crate::ir::{IrType, PointerKind, Receiver, Signature};
+use crate::ir::{IrType, PointerKind, Receiver, RustExportProblem, Signature};
 
 /// Compare the Java and Rust sides and accumulate diagnostics.
 pub fn check(java: &[Signature], rust: &[Signature]) -> Report {
     let mut report = Report::default();
 
-    // Index Rust exports by symbol; flag duplicates.
+    // Index Rust exports by symbol; flag duplicates. Structurally-broken
+    // `Java_*` fns (W002 / E004) are reported here and excluded from matching
+    // and from the orphan check below.
     let mut rust_index: HashMap<&str, &Signature> = HashMap::new();
     for r in rust {
+        if let Some(problem) = r.export_problem {
+            report.push(export_problem_diag(r, problem));
+            continue;
+        }
         if rust_index.insert(&r.key.symbol, r).is_some() {
             report.push(
                 Diagnostic::error("E000", format!("duplicate Rust export `{}`", r.key.symbol))
@@ -22,8 +28,25 @@ pub fn check(java: &[Signature], rust: &[Signature]) -> Report {
     }
 
     let mut matched: HashSet<&str> = HashSet::new();
+    let mut java_seen: HashSet<&str> = HashSet::new();
 
     for j in java {
+        // Two Java natives mangling to one symbol (E005) — the mirror of the
+        // Rust-side E000 duplicate check.
+        if !java_seen.insert(j.key.symbol.as_str()) {
+            report.push(
+                Diagnostic::error(
+                    "E005",
+                    format!(
+                        "duplicate Java native methods mangle to the same symbol `{}`",
+                        j.key.symbol
+                    ),
+                )
+                .with_java(j.origin.java.clone())
+                .note("two native declarations produce one JNI symbol; only one Rust export can match"),
+            );
+        }
+
         let Some(r) = rust_index.get(j.key.symbol.as_str()).copied() else {
             report.push(
                 Diagnostic::error(
@@ -82,8 +105,12 @@ pub fn check(java: &[Signature], rust: &[Signature]) -> Report {
         }
     }
 
-    // Orphan Rust exports: `Java_*` with no Java native method.
+    // Per-Rust-export lints over well-formed exports: orphans (W001) and
+    // borrow-handle returns (W003). Broken exports already reported above.
     for r in rust {
+        if r.export_problem.is_some() {
+            continue;
+        }
         if !matched.contains(&r.key.symbol.as_str()) {
             report.push(
                 Diagnostic::warning(
@@ -96,9 +123,54 @@ pub fn check(java: &[Signature], rust: &[Signature]) -> Report {
                 .with_rust(r.origin.rust.clone()),
             );
         }
+        // Returning a borrow handle hands a borrowed lifetime to Java, which has
+        // no borrow checker to keep the pointee alive (W003).
+        if let IrType::Pointer(p) = &r.ret
+            && matches!(p.kind, PointerKind::Ref | PointerKind::Mut)
+        {
+            report.push(
+                Diagnostic::warning(
+                    "W003",
+                    format!("Rust export `{}` returns a borrow handle", r.key.symbol),
+                )
+                .with_rust(r.origin.rust.clone())
+                .expected_found(
+                    "an owned return (`JOwned`, an object, or a primitive)",
+                    format!("a borrowed `{}` handle", p.kind.wrapper()),
+                )
+                .help(
+                    "return `JOwned` instead; a borrowed `JRef`/`JMut` outlives its Rust borrow once handed to Java → use-after-free",
+                ),
+            );
+        }
     }
 
     report
+}
+
+/// Diagnostic for a structurally-broken Rust `Java_*` fn (W002 / E004).
+fn export_problem_diag(r: &Signature, problem: RustExportProblem) -> Diagnostic {
+    match problem {
+        RustExportProblem::NotExported => Diagnostic::warning(
+            "W002",
+            format!("`{}` looks like a JNI export but is not exported", r.key.symbol),
+        )
+        .with_rust(r.origin.rust.clone())
+        .help(
+            "add `#[unsafe(no_mangle)]` and `extern \"system\"`, or rename it if it is not a native method",
+        ),
+        RustExportProblem::TooFewParams => Diagnostic::error(
+            "E004",
+            format!(
+                "JNI export `{}` has too few parameters (no room for JNIEnv + class/this)",
+                r.key.symbol
+            ),
+        )
+        .with_rust(r.origin.rust.clone())
+        .help(
+            "a native method's Rust fn takes `JNIEnv`/`EnvUnowned` then a `JClass`/`JObject` receiver, before its declared parameters",
+        ),
+    }
 }
 
 fn check_receiver(j: &Signature, r: &Signature, report: &mut Report) {
@@ -147,6 +219,31 @@ fn compare(
         j.key.java_class.replace('/', "."),
         j.key.java_method
     );
+
+    // A pointer annotation on a non-`long` slot (E026), reported once and
+    // short-circuited. Only the Java loader produces `Misannotated`.
+    if let IrType::Misannotated {
+        ann_kind,
+        java_desc,
+        narrow_int,
+    } = java
+    {
+        let msg = if *narrow_int {
+            format!(
+                "{head}: {} annotation on `{java_desc}` — a JNI handle is a 64-bit `long` and does not fit (it would be truncated)",
+                ann_kind.annotation()
+            )
+        } else {
+            format!(
+                "{head}: {} annotation on a non-`long` slot (`{java_desc}`)",
+                ann_kind.annotation()
+            )
+        };
+        return vec![
+            mk('6', msg)
+                .help("place `@Ref`/`@Mut`/`@Owned` only on a `long` parameter or return type"),
+        ];
+    }
 
     // An unsupported type on either side is reported once and short-circuits.
     if let IrType::Unsupported(s) = java {
@@ -232,5 +329,59 @@ fn nullability_desc(nullable: bool) -> String {
         "nullable (Java default / Rust `Option<..>`)".to_owned()
     } else {
         "non-nullable (Java `nullable=false` / bare Rust wrapper)".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check;
+    use crate::ir::{IrType, JavaLoc, MethodKey, Origin, Receiver, Signature};
+
+    fn java_sig(symbol: &str, method: &str) -> Signature {
+        Signature {
+            key: MethodKey {
+                symbol: symbol.to_owned(),
+                java_class: "example/Foo".to_owned(),
+                java_method: method.to_owned(),
+            },
+            is_static: true,
+            receiver: Receiver::Unknown,
+            params: Vec::new(),
+            ret: IrType::Void,
+            origin: Origin {
+                rust: None,
+                java: Some(JavaLoc {
+                    class: "example/Foo".to_owned(),
+                    method: method.to_owned(),
+                    descriptor: "()V".to_owned(),
+                }),
+            },
+            export_problem: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_java_symbol_reports_e005() {
+        // Two distinct natives mangling to one symbol (hard to express via javac,
+        // which forbids true duplicates).
+        let java = vec![
+            java_sig("Java_example_Foo_bar", "bar"),
+            java_sig("Java_example_Foo_bar", "bar"),
+        ];
+        let report = check(&java, &[]);
+        assert!(
+            report.has_code("E005"),
+            "expected E005:\n{}",
+            report.render_human()
+        );
+    }
+
+    #[test]
+    fn distinct_java_symbols_no_e005() {
+        let java = vec![
+            java_sig("Java_example_Foo_a", "a"),
+            java_sig("Java_example_Foo_b", "b"),
+        ];
+        assert!(!check(&java, &[]).has_code("E005"));
     }
 }

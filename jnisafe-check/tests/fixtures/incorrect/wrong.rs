@@ -80,3 +80,32 @@ pub extern "system" fn Java_example_Incorrect_orphan<'local>(
     _class: JClass<'local>,
 ) {
 }
+
+// Java annotates an `int` slot with @Ref; a handle can't fit there (E026).
+#[no_mangle]
+pub extern "system" fn Java_example_Incorrect_badSlot<'local>(
+    _env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    _handle: jint,
+) {
+}
+
+// Returns a borrow handle (JRef) to Java — borrowed lifetime escapes (W003).
+#[no_mangle]
+pub extern "system" fn Java_example_Incorrect_borrowReturn<'local>(
+    _env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JRef<'local, Box<String>> {
+    unimplemented!()
+}
+
+// Looks like an export but is missing #[no_mangle] → not actually exported (W002).
+pub extern "system" fn Java_example_Incorrect_notExported<'local>(
+    _env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) {
+}
+
+// Too few parameters: no room for JNIEnv + receiver (E004).
+#[no_mangle]
+pub extern "system" fn Java_example_Incorrect_tooFewParams<'local>(_env: EnvUnowned<'local>) {}
