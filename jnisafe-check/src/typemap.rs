@@ -58,6 +58,10 @@ pub fn rust_simple_type(name: &str) -> Option<IrType> {
         "JClass" | "jclass" => "java/lang/Class",
         "JThrowable" | "jthrowable" => "java/lang/Throwable",
         "JByteBuffer" => "java/nio/ByteBuffer",
+        // Canonical 1:1 jni-rs collection wrappers (reduce spurious E029).
+        "JList" => "java/util/List",
+        "JMap" => "java/util/Map",
+        "JSet" => "java/util/Set",
         "JByteArray" | "jbyteArray" => "[B",
         "JBooleanArray" | "jbooleanArray" => "[Z",
         "JCharArray" | "jcharArray" => "[C",
@@ -106,6 +110,18 @@ mod tests {
         };
         assert_eq!(rust_simple_type("JString"), Some(s.clone()));
         assert_eq!(rust_simple_type("jstring"), Some(s));
+    }
+
+    #[test]
+    fn maps_collection_wrappers() {
+        let obj = |c: &str| {
+            Some(IrType::JavaObject {
+                class: c.to_owned(),
+            })
+        };
+        assert_eq!(rust_simple_type("JList"), obj("java/util/List"));
+        assert_eq!(rust_simple_type("JMap"), obj("java/util/Map"));
+        assert_eq!(rust_simple_type("JSet"), obj("java/util/Set"));
     }
 
     #[test]
