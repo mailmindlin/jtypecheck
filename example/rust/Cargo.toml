@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# `cdylib` so the JVM can `System.loadLibrary("example")` and run `example.Main`;
+# `rlib` so `jnisafe-check`'s e2e tests can still treat it as a normal crate.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 jnisafe.workspace = true
 jni.workspace = true
