@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use jnisafe_check::cli::{Config, Format};
+use jnisafe_check::diagnostics::{Diagnostic, Report};
 use jnisafe_check::ir::{IrType, PointerKind, Receiver};
 use jnisafe_check::rust_loader::{RustExtractor, SynBackend};
 use jnisafe_check::{java_loader, run};
@@ -57,6 +58,46 @@ fn config(rust_crate: PathBuf, java: Vec<PathBuf>) -> Config {
     }
 }
 
+/// The member a diagnostic pins to: the Java method/field it fires on when it
+/// carries a Java location (native-method and flow findings), otherwise the Rust
+/// symbol (export-shape lints and Rust→Java `bind_java_type!` bindings).
+fn locus(d: &Diagnostic) -> &str {
+    if let Some(j) = &d.java {
+        &j.method
+    } else if let Some(r) = &d.rust {
+        &r.symbol
+    } else {
+        panic!("diagnostic {} carries no location to pin", d.code);
+    }
+}
+
+/// Assert a report's diagnostics are *exactly* `expected` — every `(code, locus)`
+/// pair present, with no extras and nothing missing (order-independent). Pins
+/// each finding to the member it fires on, subsuming a code-presence + count
+/// check. Prefer the [`assert_findings!`] sugar.
+#[track_caller]
+fn check_findings(report: &Report, expected: &[(&str, &str)]) {
+    let mut got: Vec<(&str, &str)> = report
+        .diagnostics
+        .iter()
+        .map(|d| (d.code.as_str(), locus(d)))
+        .collect();
+    got.sort_unstable();
+    let mut want: Vec<(&str, &str)> = expected.to_vec();
+    want.sort_unstable();
+    assert_eq!(got, want, "diagnostics mismatch:\n{report}");
+}
+
+/// `assert_findings!(report, "E001" @ "createWrongType", …)` — each `code @ member`
+/// pins one diagnostic to the Java method/field it fires on, or to its Rust
+/// symbol when it has no Java location. Asserts the listed findings are *exactly*
+/// what the report contains (see [`check_findings`]).
+macro_rules! assert_findings {
+    ($report:expr $(, $code:literal @ $member:literal)* $(,)?) => {
+        check_findings(&$report, &[$(($code, $member)),*])
+    };
+}
+
 #[test]
 fn correct_passes() {
     // example/rust implements `HandWritten` as hand-written `Java_*` exports and
@@ -87,15 +128,25 @@ fn incorrect_reports_one_diagnostic_per_case() {
     );
     let report = run(&cfg).expect("run");
 
-    for code in [
-        "E001", "E023", "E024", "E025", "E020", "E021", "E010", "E002", "W001", "E026", "E004",
-        "W002", "W003",
-    ] {
-        assert!(report.has_code(code), "missing {code}; report was:\n{report}");
-    }
-    assert!(report.has_errors());
-    assert_eq!(report.error_count(), 10);
-    assert_eq!(report.warning_count(), 3);
+    // One finding per native method, pinned to the method it fires on; the four
+    // export-shape lints (W001/W002/W003/E004) have no Java method, so they pin
+    // to the Rust symbol instead.
+    assert_findings!(
+        report,
+        "E001" @ "createWrongType",
+        "E023" @ "kindMismatch",
+        "E024" @ "typeMismatch",
+        "E025" @ "nullMismatch",
+        "E020" @ "objMismatch",
+        "E021" @ "primMismatch",
+        "E010" @ "arityMismatch",
+        "E002" @ "recvMismatch",
+        "E026" @ "badSlot",
+        "W003" @ "Java_example_Incorrect_borrowReturn",
+        "W001" @ "Java_example_Incorrect_orphan",
+        "W002" @ "Java_example_Incorrect_notExported",
+        "E004" @ "Java_example_Incorrect_tooFewParams",
+    );
 }
 
 #[test]
@@ -108,12 +159,13 @@ fn incorrect_macros_report_expected_diagnostics() {
     );
     let report = run(&cfg).expect("run");
 
-    for code in ["E023", "E024", "E021", "W003"] {
-        assert!(report.has_code(code), "missing {code}; report was:\n{report}");
-    }
-    assert!(report.has_errors());
-    assert_eq!(report.error_count(), 3);
-    assert_eq!(report.warning_count(), 1);
+    assert_findings!(
+        report,
+        "E023" @ "kindMismatch",
+        "E024" @ "typeMismatch",
+        "E021" @ "primMismatch",
+        "W003" @ "Java_example_IncorrectMacros_borrowReturn",
+    );
 }
 
 #[test]
@@ -127,12 +179,17 @@ fn incorrect_calls_report_expected_diagnostics() {
     );
     let report = run(&cfg).expect("run");
 
-    for code in ["E040", "E041", "E042", "E043", "E044", "W004"] {
-        assert!(report.has_code(code), "missing {code}; report was:\n{report}");
-    }
-    assert!(report.has_errors());
-    assert_eq!(report.error_count(), 5);
-    assert_eq!(report.warning_count(), 1);
+    // Reverse-direction findings carry no Java location, so each pins to the
+    // `class.member` Rust symbol the binding names.
+    assert_findings!(
+        report,
+        "E040" @ "example.IncorrectCalls.ghostMethod",
+        "E041" @ "example.IncorrectCalls.realMethod",
+        "E042" @ "example.IncorrectCalls.missingField",
+        "E043" @ "example.IncorrectCalls.instanceValue",
+        "E044" @ "example.IncorrectCalls.<init>",
+        "W004" @ "example.NotLoadedClass.whatever",
+    );
 }
 
 #[test]
@@ -148,14 +205,13 @@ fn field_handle_annotations_report_expected_diagnostics() {
     );
     let report = run(&cfg).expect("run");
 
-    for code in ["W005", "E045"] {
-        assert!(report.has_code(code), "missing {code}; report was:\n{report}");
-    }
-    // `cached` is a clean match: no field existence/type errors fire.
-    assert!(!report.has_code("E042"), "{report}");
-    assert!(!report.has_code("E043"), "{report}");
-    assert_eq!(report.error_count(), 1);
-    assert_eq!(report.warning_count(), 1);
+    // Exactly these two findings — which also proves `cached` is a clean match
+    // (no E042/E043 field existence/type errors, no extra diagnostics).
+    assert_findings!(
+        report,
+        "W005" @ "example.FieldHandles.bare",
+        "E045" @ "example.FieldHandles.wrong",
+    );
 }
 
 #[test]
@@ -287,7 +343,6 @@ fn rust_loader_skips_env_and_receiver() {
 // (no orphan-export / signature noise). They are the executable spec for the
 // analysis and FAIL until each phase lands; treat them as the progress tracker.
 
-use jnisafe_check::diagnostics::Report;
 use jnisafe_check::flow;
 
 fn flow_report(class_rel: &str) -> Report {
@@ -296,86 +351,83 @@ fn flow_report(class_rel: &str) -> Report {
     report
 }
 
-fn assert_codes(report: &Report, codes: &[&str]) {
-    for code in codes {
-        assert!(
-            report.has_code(code),
-            "missing {code}; report was:\n{report}",
-        );
-    }
-}
-
 #[test]
 fn flow_basic_cases() {
-    // test1..test5: one diagnostic each.
+    // test1..test5: one diagnostic each, pinned to its method.
     let r = flow_report("example/Flow.class");
-    assert_codes(&r, &["W010", "W011", "E061", "E062", "E063"]);
-    assert_eq!(r.error_count(), 3, "{r}");
-    assert_eq!(r.warning_count(), 2, "{r}");
+    assert_findings!(
+        r,
+        "W010" @ "test1",
+        "W011" @ "test2",
+        "E061" @ "test3",
+        "E062" @ "test4",
+        "E063" @ "test5",
+    );
 }
 
 #[test]
 fn flow_forging() {
     // A fabricated constant and a literal-0-into-non-nullable, both E060.
     let r = flow_report("example/Forge.class");
-    assert_codes(&r, &["E060"]);
-    assert_eq!(r.error_count(), 2, "{r}");
-    assert_eq!(r.warning_count(), 0, "{r}");
+    assert_findings!(
+        r,
+        "E060" @ "fabricate",
+        "E060" @ "nullIntoNonNullable",
+    );
 }
 
 #[test]
 fn flow_field_take_and_overwrite() {
     // takeWithoutClear -> E064; overwriteLive -> W012.
     let r = flow_report("example/FieldTake.class");
-    assert_codes(&r, &["E064", "W012"]);
-    assert_eq!(r.error_count(), 1, "{r}");
-    assert_eq!(r.warning_count(), 1, "{r}");
+    assert_findings!(
+        r,
+        "E064" @ "takeWithoutClear",
+        "W012" @ "overwriteLive",
+    );
 }
 
 #[test]
 fn flow_owned_field_never_disposed() {
-    // No method consumes the owned field -> W013.
+    // No method consumes the owned field -> W013, pinned to the leaked field.
     let leak = flow_report("example/OwnedFieldLeak.class");
-    assert_codes(&leak, &["W013"]);
-    assert_eq!(leak.warning_count(), 1, "{leak}");
-    assert_eq!(leak.error_count(), 0, "{leak}");
+    assert_findings!(leak, "W013" @ "handle");
 
     // The control class disposes its field cleanly -> nothing.
     let ok = flow_report("example/OwnedFieldDisposed.class");
-    assert_eq!(ok.diagnostics.len(), 0, "{ok}");
+    assert_findings!(ok);
 }
 
 #[test]
 fn flow_exclusive_aliasing() {
     // assign(p, p) with assign(@Mut, @Ref) -> E065.
     let r = flow_report("example/AliasFlow.class");
-    assert_codes(&r, &["E065"]);
-    assert_eq!(r.error_count(), 1, "{r}");
-    assert_eq!(r.warning_count(), 0, "{r}");
+    assert_findings!(r, "E065" @ "aliasMutRef");
 }
 
 #[test]
 fn flow_affine_move() {
     // `b = a` moves a; using a afterwards -> E063.
     let r = flow_report("example/AffineMove.class");
-    assert_codes(&r, &["E063"]);
-    assert_eq!(r.error_count(), 1, "{r}");
-    assert_eq!(r.warning_count(), 0, "{r}");
+    assert_findings!(r, "E063" @ "doubleUse");
 }
 
 #[test]
 fn flow_exposed_handles() {
-    // A public handle field and a public handle-returning method -> two W014.
+    // A public handle field (`exposed`) and a public handle-returning method
+    // (`take`) each raise W014; the private `hidden` field stays silent.
     let r = flow_report("example/ExposeFlow.class");
-    assert_codes(&r, &["W014"]);
-    assert_eq!(r.warning_count(), 2, "{r}");
-    assert_eq!(r.error_count(), 0, "{r}");
+    assert_findings!(
+        r,
+        "W014" @ "exposed",
+        "W014" @ "take",
+    );
 }
 
 #[test]
 fn flow_suppression_silences_category() {
-    // Two identical E061 violations; @SuppressJni("transmute") silences one.
+    // Two identical E061 violations; @SuppressJni("transmute") silences the one
+    // in `suppressed()`, leaving only `active()`.
     let r = flow_report("example/SuppressFlow.class");
-    assert_codes(&r, &["E061"]);
-    assert_eq!(r.error_count(), 1, "{r}");
+    assert_findings!(r, "E061" @ "active");
 }
