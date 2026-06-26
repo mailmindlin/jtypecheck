@@ -50,20 +50,25 @@ cmd = "mvn -B -f jnisafe-annotations/pom.xml clean package"
 [tasks.publish-annotations]
 cmd = "mvn -B -f jnisafe-annotations/pom.xml -Prelease clean deploy"
 
-# Regenerate the committed `.class` test fixtures consumed by the Rust e2e tests
-# (see jnisafe-check/tests/e2e.rs). Run this whenever the example Java changes.
+# Compile the Java `.class` files consumed by the Rust e2e tests and the demo
+# (see jnisafe-check/tests/e2e.rs). The output dir is gitignored — these are
+# build artifacts, not committed. Sources come from two places:
+#   * example/java        — the correct, user-facing example classes
+#   * tests/fixtures/*     — the intentionally-broken classes paired with each
+#                           fixture's wrong.rs
+# All are `package example;`, so they land together in classes/example/.
+# Run this whenever the example or fixture Java changes (`pixi run test` does).
 [tasks.fixtures]
-cmd = "javac -cp build/annotations/classes -d jnisafe-check/tests/fixtures/classes example/java/example/*.java"
+cmd = "javac -g -cp build/annotations/classes -d jnisafe-check/tests/fixtures/classes example/java/example/*.java jnisafe-check/tests/fixtures/incorrect/*.java jnisafe-check/tests/fixtures/incorrect_macros/*.java jnisafe-check/tests/fixtures/incorrect_calls/*.java"
 depends-on = ["compile-annotations"]
-inputs = ["example/java/example/*.java", "build/annotations/classes/**/*.class"]
+inputs = [
+  "example/java/example/*.java",
+  "jnisafe-check/tests/fixtures/incorrect/*.java",
+  "jnisafe-check/tests/fixtures/incorrect_macros/*.java",
+  "jnisafe-check/tests/fixtures/incorrect_calls/*.java",
+  "build/annotations/classes/**/*.class",
+]
 outputs = ["jnisafe-check/tests/fixtures/classes/example/*.class"]
-
-# Compile the example Java into a throwaway classes dir for the `demo` task.
-[tasks.compile-example]
-cmd = "javac -cp build/annotations/classes -d build/example/classes example/java/example/*.java"
-depends-on = ["compile-annotations"]
-inputs = ["example/java/example/*.java", "build/annotations/classes/**/*.class"]
-outputs = ["build/example/classes/**/*.class"]
 
 # --- Rust build / test / run ----------------------------------------------
 
@@ -82,10 +87,16 @@ depends-on = ["fixtures"]
 [tasks.check-jni]
 cmd = "cargo run -p jnisafe-check --"
 
-# End-to-end demo: build example Java classes and check them against example/rust.
+# End-to-end demo: build the Java classes and run the checker against them.
+# Driven by `jnisafe-check/examples/demo.rs`, which shows both sides of the tool:
+#   * positive — the five correct classes match `example/rust` cleanly, and
+#   * negative — the intentionally-wrong Incorrect* classes are rejected with the
+#     exact diagnostics we expect (paired with the fixture wrong.rs, not example/rust).
+# Reuses the same generated `.class` files as the test suite.
+# Exits non-zero if any phase doesn't match expectations.
 [tasks.demo]
-cmd = "cargo run -p jnisafe-check -- --rust-crate example/rust --java build/example/classes/example/Correct.class"
-depends-on = ["compile-example"]
+cmd = "cargo run -p jnisafe-check --example demo"
+depends-on = ["fixtures"]
 
 # --- Quality / housekeeping -------------------------------------------------
 
