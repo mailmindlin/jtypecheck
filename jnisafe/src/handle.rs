@@ -43,6 +43,38 @@ impl<T: IntoJavaPtr> Deref for JRef<'_, T> {
     }
 }
 
+impl<T: IntoJavaPtr> JRef<'_, T> {
+    /// Reconstruct a borrowed shared handle from a raw `jlong` that Java handed
+    /// back outside the parameter path — read out of a field, returned from
+    /// another call, etc. — or `None` when `addr` is `0`.
+    ///
+    /// Receiving a `JRef` as a native-method parameter is sound automatically:
+    /// the JVM keeps the receiver (and the handle) alive for the synchronous
+    /// call. A bare `jlong` carries no such guarantee, so that part of the
+    /// contract moves to you (typically a field read out from under a lock).
+    ///
+    /// # Safety
+    ///
+    /// `addr` must be a handle previously produced for a `T` (via
+    /// [`JOwned::from`] / [`JOwned::into_raw`](JOwned::into_raw)) and
+    /// still owned by Java, and the pointee must stay live and free of any
+    /// concurrent `&mut` for all of `'a`. In practice you must hold a lock that
+    /// blocks the owner from freeing or mutating it for `'a` — e.g. the read
+    /// lock of the `NativeObject` Java helper. Naming an `'a` that outlives that
+    /// lock, or wrapping a stale/foreign address, is undefined behaviour. Note
+    /// that a read lock permits concurrent readers, so a `Box<T>` pointee read
+    /// this way must additionally be `Sync`; prefer `Arc` for shared access.
+    #[must_use]
+    pub unsafe fn from_raw(addr: jlong) -> Option<Self> {
+        let internal = NonZero::new(addr)?;
+        rt_validate!(internal, T::Target, "JRef::from_raw");
+        Some(Self {
+            internal,
+            lifetime: PhantomData,
+        })
+    }
+}
+
 impl<T: IntoJavaPtr + Send + Sync> UnwindSafe for JRef<'_, Arc<T>> {}
 impl<T: IntoJavaPtr + Send + Sync> RefUnwindSafe for JRef<'_, Arc<T>> {}
 impl<T: IntoJavaPtr + Send> UnwindSafe for JRef<'_, Box<T>> {}
@@ -96,6 +128,31 @@ impl<T: IntoJavaPtrMut> JMut<'_, T> {
             ptr,
             _life: PhantomData,
         }
+    }
+}
+
+impl<T: IntoJavaPtr> JMut<'_, T> {
+    /// Reconstruct a borrowed mutable handle from a raw `jlong` read out of a
+    /// Java field, or `None` when `addr` is `0`.
+    ///
+    /// # Safety
+    ///
+    /// In addition to the contract of
+    /// [`JRef::from_raw`](JRef::from_raw), you must guarantee this
+    /// is the *only* live handle to the pointee for all of `'local` — no other
+    /// `JRef`/`JMut`/`JOwned` over the same address, on this or any other
+    /// thread. In practice that means holding an exclusive (write) lock, e.g.
+    /// the `NativeObject` Java helper's `nativeWrite` path. Reading the same
+    /// field twice to mint two `JMut`s aliases `&mut` and is undefined
+    /// behaviour.
+    #[must_use]
+    pub unsafe fn from_raw(addr: jlong) -> Option<Self> {
+        let internal = NonZero::new(addr)?;
+        rt_validate!(internal, T::Target, "JMut::from_raw");
+        Some(Self {
+            internal,
+            lifetime: PhantomData,
+        })
     }
 }
 
@@ -208,6 +265,59 @@ impl<T: IntoJavaPtr> JOwned<T> {
             _life: PhantomData,
         })
     }
+
+    /// Reconstruct an owned handle from a raw `jlong` (e.g. read out of a Java
+    /// field), transferring ownership back to Rust. A `0` address yields a null
+    /// `JOwned` (`into_inner` → `None`). After this call the returned `JOwned`
+    /// owns the allocation: dropping it (or [`into_inner`](Self::into_inner))
+    /// frees it, so you must clear the source the `jlong` came from (set the
+    /// field to `0`) so Java can never hand the same address out again.
+    ///
+    /// Pairs with [`into_raw`](Self::into_raw), which stored the handle
+    /// while *keeping* its registration; this transfers that registration's
+    /// ownership back so the final drop balances it.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must be a handle previously produced for a `T` and not yet
+    /// reclaimed; you must guarantee no other handle to it is in use and that no
+    /// other thread can also reclaim it — hold the owner's exclusive lock while
+    /// you read-and-clear the field. Reclaiming an address twice is a double
+    /// free.
+    #[must_use]
+    pub unsafe fn from_raw(addr: jlong) -> Self {
+        let internal = NonZero::new(addr);
+        // Debug-only: the bound handle exists solely to feed `rt_validate!`, so
+        // gate the whole branch to avoid an unused binding in release.
+        #[cfg(debug_assertions)]
+        if let Some(internal) = internal {
+            rt_validate!(internal, T::Target, "JOwned::from_raw");
+        }
+        Self {
+            internal,
+            ty: PhantomData,
+        }
+    }
+
+    /// Consume this owned handle and return its raw `jlong` to hand to Java
+    /// (storing it in a field, returning it from another call, …), **keeping**
+    /// the debug-registry entry live because the handle is still live in Java's
+    /// hands (ownership passes to Java). Returns `0` for a null `JOwned`.
+    ///
+    /// Deliberately asymmetric with [`into_inner`](Self::into_inner):
+    /// `into_inner` deregisters and hands you back the Rust value, whereas
+    /// `into_raw` keeps the registration and hands Java the address.
+    /// Recover it with [`from_raw`](Self::from_raw). Storing the
+    /// returned address in more than one field — or producing it and then also
+    /// dropping a copy of the handle — is a double free.
+    #[must_use]
+    pub fn into_raw(self) -> jlong {
+        let this = ManuallyDrop::new(self);
+        match this.internal {
+            Some(internal) => internal.get(),
+            None => 0,
+        }
+    }
 }
 
 /// Construct a null `JOwned<T>`
@@ -295,17 +405,18 @@ mod tests {
         }
     }
 
-    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    // Each `DropCounter` test owns a function-local counter rather than a shared
+    // module static, so the suite stays correct under parallel execution.
 
     #[test]
     fn drop_frees_exactly_once() {
-        DROPS.store(0, Ordering::SeqCst);
+        static D: AtomicUsize = AtomicUsize::new(0);
         {
-            let _owned: JOwned<Box<DropCounter>> = Box::new(DropCounter(&DROPS)).into();
-            assert_eq!(DROPS.load(Ordering::SeqCst), 0, "not dropped while held");
+            let _owned: JOwned<Box<DropCounter>> = Box::new(DropCounter(&D)).into();
+            assert_eq!(D.load(Ordering::SeqCst), 0, "not dropped while held");
         }
         assert_eq!(
-            DROPS.load(Ordering::SeqCst),
+            D.load(Ordering::SeqCst),
             1,
             "dropped once when JOwned drops"
         );
@@ -313,16 +424,78 @@ mod tests {
 
     #[test]
     fn take_suppresses_drop() {
-        DROPS.store(0, Ordering::SeqCst);
-        let owned: JOwned<Box<DropCounter>> = Box::new(DropCounter(&DROPS)).into();
+        static D: AtomicUsize = AtomicUsize::new(0);
+        let owned: JOwned<Box<DropCounter>> = Box::new(DropCounter(&D)).into();
         let recovered = owned.into_inner().expect("Some");
-        assert_eq!(DROPS.load(Ordering::SeqCst), 0, "take must not drop");
+        assert_eq!(D.load(Ordering::SeqCst), 0, "take must not drop");
         drop(recovered);
         assert_eq!(
-            DROPS.load(Ordering::SeqCst),
+            D.load(Ordering::SeqCst),
             1,
             "dropped once via recovered value"
         );
+    }
+
+    #[test]
+    fn raw_round_trips_owned() {
+        let owned: JOwned<Box<String>> = Box::new("field".to_string()).into();
+        let raw = owned.into_raw();
+        assert_ne!(raw, 0, "non-null handle yields a non-zero jlong");
+        // Take ownership back out of the (simulated) field.
+        let back: JOwned<Box<String>> = unsafe { JOwned::from_raw(raw) };
+        assert_eq!(&**back, "field");
+        assert_eq!(
+            back.into_inner().as_deref().map(String::as_str),
+            Some("field")
+        );
+    }
+
+    #[test]
+    fn raw_null_round_trips() {
+        let null: JOwned<Box<String>> = JOwned::null();
+        assert_eq!(null.into_raw(), 0, "null handle stores as 0");
+        let back: JOwned<Box<String>> = unsafe { JOwned::from_raw(0) };
+        assert!(back.into_inner().is_none(), "0 decodes to a null JOwned");
+        // Borrowed handles decode 0 to None.
+        assert!(unsafe { JRef::<'static, Box<String>>::from_raw(0) }.is_none());
+        assert!(unsafe { JMut::<'static, Box<String>>::from_raw(0) }.is_none());
+    }
+
+    #[test]
+    fn into_raw_does_not_drop() {
+        // A dedicated counter so this test doesn't race the other `DROPS` users
+        // when the suite runs in parallel.
+        static D: AtomicUsize = AtomicUsize::new(0);
+        let owned: JOwned<Box<DropCounter>> = Box::new(DropCounter(&D)).into();
+        let raw = owned.into_raw();
+        assert_eq!(
+            D.load(Ordering::SeqCst),
+            0,
+            "storing into a field must not drop"
+        );
+        // Reclaim and drop exactly once.
+        let back: JOwned<Box<DropCounter>> = unsafe { JOwned::from_raw(raw) };
+        drop(back);
+        assert_eq!(
+            D.load(Ordering::SeqCst),
+            1,
+            "reclaim then drop frees exactly once"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn into_raw_keeps_registration() {
+        // `into_raw` must keep the registration live (unlike `into_inner`),
+        // so a borrowed view over the stored handle still validates.
+        let owned: JOwned<Box<String>> = Box::new("hi".to_string()).into();
+        let raw = owned.into_raw();
+        let r: JRef<'static, Box<String>> =
+            unsafe { JRef::from_raw(raw) }.expect("non-zero handle");
+        assert_eq!(&**r, "hi"); // deref validates → would panic if deregistered
+        // Reclaim to balance the registration and free the allocation.
+        let back: JOwned<Box<String>> = unsafe { JOwned::from_raw(raw) };
+        drop(back);
     }
 
     #[test]
@@ -349,7 +522,10 @@ mod tests {
     fn registry_round_trip_is_clean() {
         let owned: JOwned<Box<String>> = Box::new("hi".to_string()).into();
         assert_eq!(&**owned, "hi"); // deref validates
-        assert_eq!(owned.into_inner().as_deref().map(String::as_str), Some("hi"));
+        assert_eq!(
+            owned.into_inner().as_deref().map(String::as_str),
+            Some("hi")
+        );
     }
 
     #[cfg(debug_assertions)]
