@@ -69,11 +69,7 @@ fn correct_passes() {
         ],
     );
     let report = run(&cfg).expect("run");
-    assert!(
-        !report.has_errors(),
-        "expected no errors, got:\n{}",
-        report.render_human()
-    );
+    assert!(!report.has_errors(), "expected no errors, got:\n{report}");
     assert_eq!(report.diagnostics.len(), 0);
 }
 
@@ -89,11 +85,7 @@ fn incorrect_reports_one_diagnostic_per_case() {
         "E001", "E023", "E024", "E025", "E020", "E021", "E010", "E002", "W001", "E026", "E004",
         "W002", "W003",
     ] {
-        assert!(
-            report.has_code(code),
-            "missing {code}; report was:\n{}",
-            report.render_human()
-        );
+        assert!(report.has_code(code), "missing {code}; report was:\n{report}");
     }
     assert!(report.has_errors());
     assert_eq!(report.error_count(), 10);
@@ -113,11 +105,7 @@ fn incorrect_macros_report_expected_diagnostics() {
     let report = run(&cfg).expect("run");
 
     for code in ["E023", "E024", "E021", "W003"] {
-        assert!(
-            report.has_code(code),
-            "missing {code}; report was:\n{}",
-            report.render_human()
-        );
+        assert!(report.has_code(code), "missing {code}; report was:\n{report}");
     }
     assert!(report.has_errors());
     assert_eq!(report.error_count(), 3);
@@ -136,11 +124,7 @@ fn incorrect_calls_report_expected_diagnostics() {
     let report = run(&cfg).expect("run");
 
     for code in ["E040", "E041", "E042", "E043", "E044", "W004"] {
-        assert!(
-            report.has_code(code),
-            "missing {code}; report was:\n{}",
-            report.render_human()
-        );
+        assert!(report.has_code(code), "missing {code}; report was:\n{report}");
     }
     assert!(report.has_errors());
     assert_eq!(report.error_count(), 5);
@@ -161,15 +145,11 @@ fn field_handle_annotations_report_expected_diagnostics() {
     let report = run(&cfg).expect("run");
 
     for code in ["W005", "E045"] {
-        assert!(
-            report.has_code(code),
-            "missing {code}; report was:\n{}",
-            report.render_human()
-        );
+        assert!(report.has_code(code), "missing {code}; report was:\n{report}");
     }
     // `cached` is a clean match: no field existence/type errors fire.
-    assert!(!report.has_code("E042"), "{}", report.render_human());
-    assert!(!report.has_code("E043"), "{}", report.render_human());
+    assert!(!report.has_code("E042"), "{report}");
+    assert!(!report.has_code("E043"), "{report}");
     assert_eq!(report.error_count(), 1);
     assert_eq!(report.warning_count(), 1);
 }
@@ -187,9 +167,7 @@ fn overloaded_macro_methods_match_when_supported() {
     let report = run(&cfg).expect("run");
     assert!(
         !report.has_errors(),
-        "overloaded macro natives should match their Java declarations:\n{}",
-        report.render_human()
-    );
+        "overloaded macro natives should match their Java declarations:\n{report}");
 }
 
 #[test]

@@ -177,3 +177,15 @@ impl Report {
         out
     }
 }
+
+impl std::fmt::Display for Report {
+    /// `{}` renders rustc-style human output; `{:#}` renders JSONL.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rendered = if f.alternate() {
+            self.render_json()
+        } else {
+            self.render_human()
+        };
+        f.write_str(&rendered)
+    }
+}
