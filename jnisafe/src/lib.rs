@@ -108,11 +108,11 @@ pub unsafe trait IntoJavaPtr: 'static + Deref<Target: Sized + 'static> {
 
 unsafe impl<T: Send + Sync + 'static> IntoJavaPtr for Arc<T> {
     unsafe fn from_raw(ptr: *mut T) -> Self {
-        unsafe { Arc::from_raw(ptr as *const T) }
+        unsafe { Arc::from_raw(ptr.cast_const()) }
     }
 
     unsafe fn to_raw(self) -> NonNull<T> {
-        let ptr = Arc::into_raw(self) as *mut T;
+        let ptr = Arc::into_raw(self).cast_mut();
         NonNull::new(ptr).unwrap()
     }
 }
@@ -181,7 +181,7 @@ pub struct JRef<'a, T: IntoJavaPtr> {
     lifetime: PhantomData<&'a T>,
 }
 
-impl<'a, T: IntoJavaPtr> Deref for JRef<'a, T> {
+impl<T: IntoJavaPtr> Deref for JRef<'_, T> {
     type Target = T::Target;
 
     fn deref(&self) -> &Self::Target {
@@ -194,10 +194,10 @@ impl<'a, T: IntoJavaPtr> Deref for JRef<'a, T> {
     }
 }
 
-impl<'a, T: IntoJavaPtr + Send + Sync> UnwindSafe for JRef<'a, Arc<T>> {}
-impl<'a, T: IntoJavaPtr + Send + Sync> RefUnwindSafe for JRef<'a, Arc<T>> {}
-impl<'a, T: IntoJavaPtr + Send> UnwindSafe for JRef<'a, Box<T>> {}
-impl<'a, T: IntoJavaPtr + Send> RefUnwindSafe for JRef<'a, Box<T>> {}
+impl<T: IntoJavaPtr + Send + Sync> UnwindSafe for JRef<'_, Arc<T>> {}
+impl<T: IntoJavaPtr + Send + Sync> RefUnwindSafe for JRef<'_, Arc<T>> {}
+impl<T: IntoJavaPtr + Send> UnwindSafe for JRef<'_, Box<T>> {}
+impl<T: IntoJavaPtr + Send> RefUnwindSafe for JRef<'_, Box<T>> {}
 
 /// Borrowed, non-null mutable pointer to a Java-owned Rust object.
 ///
@@ -206,12 +206,12 @@ impl<'a, T: IntoJavaPtr + Send> RefUnwindSafe for JRef<'a, Box<T>> {}
 /// duplicate mutable handle would alias.
 #[repr(transparent)]
 #[derive(Debug)]
-pub struct JMut<'a, T: IntoJavaPtr> {
+pub struct JMut<'local, T: IntoJavaPtr> {
     internal: NonZero<jlong>,
-    lifetime: PhantomData<&'a mut T>,
+    lifetime: PhantomData<&'local mut T>,
 }
 
-impl<'a, T: IntoJavaPtr> Deref for JMut<'a, T> {
+impl<T: IntoJavaPtr> Deref for JMut<'_, T> {
     type Target = T::Target;
     fn deref(&self) -> &Self::Target {
         rt_validate!(self.internal.get() as usize, T::Target, "JMut::deref");
@@ -221,7 +221,7 @@ impl<'a, T: IntoJavaPtr> Deref for JMut<'a, T> {
     }
 }
 
-impl<'a, T: IntoJavaPtrMut> DerefMut for JMut<'a, T> {
+impl<T: IntoJavaPtrMut> DerefMut for JMut<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         rt_validate!(self.internal.get() as usize, T::Target, "JMut::deref_mut");
         let mut ptr = from_exposed_jlong_mut::<T::Target>(self.internal);
@@ -232,7 +232,7 @@ impl<'a, T: IntoJavaPtrMut> DerefMut for JMut<'a, T> {
     }
 }
 
-impl<'a, T: IntoJavaPtrMut> JMut<'a, T> {
+impl<T: IntoJavaPtrMut> JMut<'_, T> {
     /// Borrow the pointee mutably through a checked guard. In debug builds, a
     /// second concurrent `borrow_mut()` over the *same* object (e.g. Java passed
     /// the same handle to two `@Mut` parameters) panics instead of forming two
@@ -259,12 +259,12 @@ impl<'a, T: IntoJavaPtrMut> JMut<'a, T> {
 /// panics (mutable aliasing). The flag is keyed by the object's address and
 /// cleared when the guard drops, so moving the originating handle is harmless.
 /// In release builds it is a zero-cost wrapper around the pointer.
-pub struct MutGuard<'a, T: IntoJavaPtrMut> {
+pub struct MutGuard<'guard, T: IntoJavaPtrMut> {
     ptr: NonNull<T::Target>,
-    _life: PhantomData<&'a mut T>,
+    _life: PhantomData<&'guard mut T>,
 }
 
-impl<'a, T: IntoJavaPtrMut> Deref for MutGuard<'a, T> {
+impl<T: IntoJavaPtrMut> Deref for MutGuard<'_, T> {
     type Target = T::Target;
     fn deref(&self) -> &Self::Target {
         // Safety: built from a validated, exclusively-borrowed pointer that
@@ -273,14 +273,14 @@ impl<'a, T: IntoJavaPtrMut> Deref for MutGuard<'a, T> {
     }
 }
 
-impl<'a, T: IntoJavaPtrMut> DerefMut for MutGuard<'a, T> {
+impl<T: IntoJavaPtrMut> DerefMut for MutGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // Safety: see `Deref`; the guard holds the unique mutable borrow.
         unsafe { self.ptr.as_mut() }
     }
 }
 
-impl<'a, T: IntoJavaPtrMut> Drop for MutGuard<'a, T> {
+impl<T: IntoJavaPtrMut> Drop for MutGuard<'_, T> {
     fn drop(&mut self) {
         rt_end_guard!(self.ptr.as_ptr() as usize);
     }
@@ -303,6 +303,7 @@ pub struct JOwned<T: IntoJavaPtr> {
 
 impl<T: IntoJavaPtr> JOwned<T> {
     /// Construct a null `JOwned<T>`
+    #[must_use]
     pub const fn null() -> Self {
         Self {
             internal: None,
@@ -311,7 +312,8 @@ impl<T: IntoJavaPtr> JOwned<T> {
     }
 
     /// Recover the owned smart pointer, or `None` if this `JOwned` is null.
-    pub fn take(self) -> Option<T> {
+    #[must_use]
+    pub fn into_inner(self) -> Option<T> {
         let this = ManuallyDrop::new(self);
         let internal = this.internal?;
         rt_validate!(internal.get() as usize, T::Target, "JOwned::take");
@@ -344,17 +346,17 @@ impl<T: IntoJavaPtr> JOwned<T> {
     /// the same handle to two `@Mut` parameters) panics instead of forming two
     /// aliasing `&mut`. Panics if this `JOwned` is null. Requires `T:
     /// IntoJavaPtrMut` (`Box`, not `Arc`).
-    pub fn borrow_mut(&mut self) -> MutGuard<'_, T>
+    pub fn borrow_mut(&mut self) -> Option<MutGuard<'_, T>>
     where
         T: IntoJavaPtrMut,
     {
-        let internal = self.internal.expect("borrow_mut of null JOwned");
+        let internal = self.internal?;
         rt_begin_guard!(internal.get() as usize, T::Target);
         let ptr = from_exposed_jlong_mut::<T::Target>(internal);
-        MutGuard {
+        Some(MutGuard {
             ptr,
             _life: PhantomData,
-        }
+        })
     }
 }
 
@@ -425,7 +427,7 @@ impl<T: IntoJavaPtr> Drop for JOwned<T> {
 mod registry {
     use std::any::TypeId;
     use std::collections::HashMap;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
     struct Record {
         type_id: TypeId,
@@ -443,7 +445,7 @@ mod registry {
 
     fn lock() -> MutexGuard<'static, HashMap<usize, Record>> {
         // Tolerate poisoning: a prior validation panic must not wedge the table.
-        table().lock().unwrap_or_else(|e| e.into_inner())
+        table().lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Report a violation and stop. Callers release the table lock first, so the
@@ -590,7 +592,7 @@ mod tests {
         let owned: JOwned<Box<String>> = Box::new("hello".to_string()).into();
         assert!(owned.internal.is_some(), "non-null after From");
         assert_eq!(&**owned, "hello");
-        let recovered = owned.take().expect("non-null take yields Some");
+        let recovered = owned.into_inner().expect("non-null take yields Some");
         assert_eq!(*recovered, "hello");
     }
 
@@ -598,7 +600,7 @@ mod tests {
     fn default_is_null() {
         let owned: JOwned<Box<String>> = JOwned::default();
         assert_eq!(owned.internal, None);
-        assert!(owned.take().is_none(), "null take yields None");
+        assert!(owned.into_inner().is_none(), "null take yields None");
     }
 
     #[test]
@@ -640,7 +642,7 @@ mod tests {
     fn take_suppresses_drop() {
         DROPS.store(0, Ordering::SeqCst);
         let owned: JOwned<Box<DropCounter>> = Box::new(DropCounter(&DROPS)).into();
-        let recovered = owned.take().expect("Some");
+        let recovered = owned.into_inner().expect("Some");
         assert_eq!(DROPS.load(Ordering::SeqCst), 0, "take must not drop");
         drop(recovered);
         assert_eq!(
@@ -674,7 +676,7 @@ mod tests {
     fn registry_round_trip_is_clean() {
         let owned: JOwned<Box<String>> = Box::new("hi".to_string()).into();
         assert_eq!(&**owned, "hi"); // deref validates
-        assert_eq!(owned.take().as_deref().map(String::as_str), Some("hi"));
+        assert_eq!(owned.into_inner().as_deref().map(String::as_str), Some("hi"));
     }
 
     #[cfg(debug_assertions)]
@@ -698,7 +700,7 @@ mod tests {
         let owned: JOwned<Box<String>> = Box::new("hi".to_string()).into();
         let addr = owned.internal.unwrap();
         // `take` deregisters but keeps the allocation alive in `_recovered`.
-        let _recovered = owned.take().unwrap();
+        let _recovered = owned.into_inner().unwrap();
         let stale: JRef<'static, Box<String>> = JRef {
             internal: addr,
             lifetime: PhantomData,
@@ -716,7 +718,7 @@ mod tests {
             internal: real.internal,
             ty: PhantomData,
         };
-        let _ = real.take(); // deregisters + frees the allocation
+        let _ = real.into_inner(); // deregisters + frees the allocation
         drop(dup); // JOwned::drop validates → no live handle (before the real free)
     }
 
@@ -727,7 +729,7 @@ mod tests {
         let o1: JOwned<Arc<u64>> = arc.clone().into();
         let o2: JOwned<Arc<u64>> = arc.clone().into();
         assert_eq!(o1.internal, o2.internal, "Arc clones share one address");
-        let _ = o1.take(); // owners 2 -> 1; address must stay live
+        let _ = o1.into_inner(); // owners 2 -> 1; address must stay live
         // Would panic with "no live handle" if the refcount had hit zero early.
         assert_eq!(o2.get().copied(), Some(7));
         drop(o2); // owners 1 -> 0, removed
