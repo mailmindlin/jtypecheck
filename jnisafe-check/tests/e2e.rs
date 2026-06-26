@@ -279,3 +279,103 @@ fn rust_loader_skips_env_and_receiver() {
     assert_eq!(find("Java_example_HandWritten_set").params.len(), 2);
     assert_eq!(find("Java_example_HandWritten_drop").params.len(), 1);
 }
+
+// ---- Java-side handle-flow analysis (flow.rs) -----------------------------
+//
+// These drive `flow::analyze` directly on a single fixture class, isolated from
+// the boundary check, so the reported diagnostics are exactly the flow findings
+// (no orphan-export / signature noise). They are the executable spec for the
+// analysis and FAIL until each phase lands; treat them as the progress tracker.
+
+use jnisafe_check::diagnostics::Report;
+use jnisafe_check::flow;
+
+fn flow_report(class_rel: &str) -> Report {
+    let mut report = Report::default();
+    flow::analyze(&[class(class_rel)], &mut report).expect("flow analyze");
+    report
+}
+
+fn assert_codes(report: &Report, codes: &[&str]) {
+    for code in codes {
+        assert!(
+            report.has_code(code),
+            "missing {code}; report was:\n{report}",
+        );
+    }
+}
+
+#[test]
+fn flow_basic_cases() {
+    // test1..test5: one diagnostic each.
+    let r = flow_report("example/Flow.class");
+    assert_codes(&r, &["W010", "W011", "E061", "E062", "E063"]);
+    assert_eq!(r.error_count(), 3, "{r}");
+    assert_eq!(r.warning_count(), 2, "{r}");
+}
+
+#[test]
+fn flow_forging() {
+    // A fabricated constant and a literal-0-into-non-nullable, both E060.
+    let r = flow_report("example/Forge.class");
+    assert_codes(&r, &["E060"]);
+    assert_eq!(r.error_count(), 2, "{r}");
+    assert_eq!(r.warning_count(), 0, "{r}");
+}
+
+#[test]
+fn flow_field_take_and_overwrite() {
+    // takeWithoutClear -> E064; overwriteLive -> W012.
+    let r = flow_report("example/FieldTake.class");
+    assert_codes(&r, &["E064", "W012"]);
+    assert_eq!(r.error_count(), 1, "{r}");
+    assert_eq!(r.warning_count(), 1, "{r}");
+}
+
+#[test]
+fn flow_owned_field_never_disposed() {
+    // No method consumes the owned field -> W013.
+    let leak = flow_report("example/OwnedFieldLeak.class");
+    assert_codes(&leak, &["W013"]);
+    assert_eq!(leak.warning_count(), 1, "{leak}");
+    assert_eq!(leak.error_count(), 0, "{leak}");
+
+    // The control class disposes its field cleanly -> nothing.
+    let ok = flow_report("example/OwnedFieldDisposed.class");
+    assert_eq!(ok.diagnostics.len(), 0, "{ok}");
+}
+
+#[test]
+fn flow_exclusive_aliasing() {
+    // assign(p, p) with assign(@Mut, @Ref) -> E065.
+    let r = flow_report("example/AliasFlow.class");
+    assert_codes(&r, &["E065"]);
+    assert_eq!(r.error_count(), 1, "{r}");
+    assert_eq!(r.warning_count(), 0, "{r}");
+}
+
+#[test]
+fn flow_affine_move() {
+    // `b = a` moves a; using a afterwards -> E063.
+    let r = flow_report("example/AffineMove.class");
+    assert_codes(&r, &["E063"]);
+    assert_eq!(r.error_count(), 1, "{r}");
+    assert_eq!(r.warning_count(), 0, "{r}");
+}
+
+#[test]
+fn flow_exposed_handles() {
+    // A public handle field and a public handle-returning method -> two W014.
+    let r = flow_report("example/ExposeFlow.class");
+    assert_codes(&r, &["W014"]);
+    assert_eq!(r.warning_count(), 2, "{r}");
+    assert_eq!(r.error_count(), 0, "{r}");
+}
+
+#[test]
+fn flow_suppression_silences_category() {
+    // Two identical E061 violations; @SuppressJni("transmute") silences one.
+    let r = flow_report("example/SuppressFlow.class");
+    assert_codes(&r, &["E061"]);
+    assert_eq!(r.error_count(), 1, "{r}");
+}
