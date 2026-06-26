@@ -1,7 +1,5 @@
 package example;
 
-import io.github.mailmindlin.jnisafe.Mut;
-import io.github.mailmindlin.jnisafe.Owned;
 import io.github.mailmindlin.jnisafe.Ref;
 
 /**

@@ -1,22 +1,12 @@
 # Test fixtures
 
-## `classes/` — compiled Java native-method declarations
+The negative / exhaustive cases that drive `tests/e2e.rs` and the `demo`. Each
+subdirectory pairs a deliberately-broken (or, for `overloaded/`, a deliberately-
+correct) Java class with the Rust meant to bind to it.
 
-Prebuilt `.class` files for `example.Correct` and `example.Incorrect`, committed
-so the test suite is hermetic (no `javac` at test time). The `@Ref`/`@Mut`/
-`@Owned` annotations are `@Retention(CLASS)` + `@Target(TYPE_USE)`, so they are
-embedded as `RuntimeInvisibleTypeAnnotations` in the bytecode.
+For the correct, user-facing example see the top-level
+[`example/`](../../../example/) directory instead.
 
-Regenerate after changing the example Java or the annotations:
-
-```sh
-# from the jnisafe-check/ crate root:
-javac -d /tmp/ann ../jnisafe-annotations/io/github/mailmindlin/jnisafe/*.java
-javac -cp /tmp/ann -d tests/fixtures/classes ../example/java/example/*.java
-```
-
-## `incorrect/wrong.rs` — deliberately-wrong Rust exports
-
-NOT compiled — parsed by the `syn` Rust loader as a fixture. Each function
-reproduces an `Incorrect.java` native method's mangled symbol but disagrees in
-exactly one way, so the checker emits one diagnostic per case. Each case's expected diagnostic code is documented in the `Incorrect.java` comments.
+The fixture conventions, the parse-only `wrong.rs` files, and how the gitignored
+`classes/*.class` are generated are documented in
+[development.md](../../../development.md#test-fixtures).
