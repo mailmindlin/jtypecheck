@@ -20,13 +20,19 @@ fn root() -> PathBuf {
 }
 
 fn fixture(rel: &str) -> PathBuf {
-    root().join(rel)
+    let mut root = root();
+    root.push(rel);
+    root
 }
 
 /// Resolve a generated `.class` fixture, failing with an actionable hint if the
 /// classes have not been compiled yet (they are gitignored build artifacts).
+#[track_caller]
 fn class(rel: &str) -> PathBuf {
-    let path = fixture(rel);
+    let mut path = root();
+    path.push("tests/fixtures/classes");
+    path.push(rel);
+
     assert!(
         path.exists(),
         "missing generated fixture: {}\n\
@@ -60,12 +66,12 @@ fn correct_passes() {
     let cfg = config(
         example_rust(),
         vec![
-            class("tests/fixtures/classes/example/HandWritten.class"),
-            class("tests/fixtures/classes/example/Document.class"),
-            class("tests/fixtures/classes/example/Mangle.class"),
-            class("tests/fixtures/classes/example/NativeMethod.class"),
-            class("tests/fixtures/classes/example/BindType.class"),
-            class("tests/fixtures/classes/example/Overloaded.class"),
+            class("example/HandWritten.class"),
+            class("example/Document.class"),
+            class("example/Mangle.class"),
+            class("example/NativeMethod.class"),
+            class("example/BindType.class"),
+            class("example/Overloaded.class"),
         ],
     );
     let report = run(&cfg).expect("run");
@@ -77,7 +83,7 @@ fn correct_passes() {
 fn incorrect_reports_one_diagnostic_per_case() {
     let cfg = config(
         fixture("tests/fixtures/incorrect"),
-        vec![class("tests/fixtures/classes/example/Incorrect.class")],
+        vec![class("example/Incorrect.class")],
     );
     let report = run(&cfg).expect("run");
 
@@ -98,9 +104,7 @@ fn incorrect_macros_report_expected_diagnostics() {
     // diagnostic per deliberately-wrong method across the three macro forms.
     let cfg = config(
         fixture("tests/fixtures/incorrect_macros"),
-        vec![class(
-            "tests/fixtures/classes/example/IncorrectMacros.class",
-        )],
+        vec![class("example/IncorrectMacros.class")],
     );
     let report = run(&cfg).expect("run");
 
@@ -119,7 +123,7 @@ fn incorrect_calls_report_expected_diagnostics() {
     // isolates one diagnostic, plus a binding to an unloaded class (W004).
     let cfg = config(
         fixture("tests/fixtures/incorrect_calls"),
-        vec![class("tests/fixtures/classes/example/IncorrectCalls.class")],
+        vec![class("example/IncorrectCalls.class")],
     );
     let report = run(&cfg).expect("run");
 
@@ -140,7 +144,7 @@ fn field_handle_annotations_report_expected_diagnostics() {
     // (W005); `wrong` is annotated with the wrong pointee type (E045).
     let cfg = config(
         fixture("tests/fixtures/field_handles"),
-        vec![class("tests/fixtures/classes/example/FieldHandles.class")],
+        vec![class("example/FieldHandles.class")],
     );
     let report = run(&cfg).expect("run");
 
@@ -162,7 +166,7 @@ fn overloaded_macro_methods_match_when_supported() {
     // `java_loader` produces, so they pair up cleanly with no collision.
     let cfg = config(
         fixture("tests/fixtures/overloaded"),
-        vec![class("tests/fixtures/classes/example/Overloaded.class")],
+        vec![class("example/Overloaded.class")],
     );
     let report = run(&cfg).expect("run");
     assert!(
@@ -174,7 +178,7 @@ fn overloaded_macro_methods_match_when_supported() {
 fn json_output_carries_codes() {
     let cfg = config(
         fixture("tests/fixtures/incorrect"),
-        vec![class("tests/fixtures/classes/example/Incorrect.class")],
+        vec![class("example/Incorrect.class")],
     );
     let report = run(&cfg).expect("run");
     let json = report.render_json();
@@ -192,7 +196,7 @@ fn json_output_carries_codes() {
 #[test]
 fn java_loader_reads_pointer_annotations() {
     let sigs =
-        java_loader::load(&[class("tests/fixtures/classes/example/HandWritten.class")]).unwrap();
+        java_loader::load(&[class("example/HandWritten.class")]).unwrap();
 
     let find = |method: &str| {
         sigs.iter()
