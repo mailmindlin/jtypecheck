@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, Report};
 use crate::ir::{
-    IrType, JavaClassModel, JavaFieldSig, JavaMethodSig, JavaRef, JavaRefKind, PointerKind,
-    Receiver, RustExportProblem, Signature, args_descriptor,
+    IrType, JavaClassModel, JavaFieldSig, JavaMethodSig, JavaRef, JavaRefKind, Pointer,
+    PointerKind, Receiver, RustExportProblem, Signature, args_descriptor,
 };
 
 /// Compare the Java and Rust sides and accumulate diagnostics.
@@ -175,7 +175,9 @@ pub fn check_java_refs(refs: &[JavaRef], models: &[JavaClassModel], report: &mut
                     ),
                 )
                 .with_rust(Some(r.origin.clone()))
-                .help("pass that class (or its containing dir/jar) on --java to check this binding"),
+                .help(
+                    "pass that class (or its containing dir/jar) on --java to check this binding",
+                ),
             );
             continue;
         };
@@ -197,7 +199,11 @@ fn expected_ret(ret: &IrType) -> Option<String> {
 
 fn check_method_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
     let class = r.class_internal.replace('/', ".");
-    let by_name: Vec<&JavaMethodSig> = model.methods.iter().filter(|m| m.name == r.java_name).collect();
+    let by_name: Vec<&JavaMethodSig> = model
+        .methods
+        .iter()
+        .filter(|m| m.name == r.java_name)
+        .collect();
     if by_name.is_empty() {
         report.push(
             Diagnostic::error(
@@ -209,13 +215,19 @@ fn check_method_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
         );
         return;
     }
-    let by_receiver: Vec<&&JavaMethodSig> =
-        by_name.iter().filter(|m| m.is_static == r.is_static).collect();
+    let by_receiver: Vec<&&JavaMethodSig> = by_name
+        .iter()
+        .filter(|m| m.is_static == r.is_static)
+        .collect();
     if by_receiver.is_empty() {
         report.push(
             Diagnostic::error(
                 "E040",
-                format!("no {} Java method `{}` on `{class}`", receiver_word(r.is_static), r.java_name),
+                format!(
+                    "no {} Java method `{}` on `{class}`",
+                    receiver_word(r.is_static),
+                    r.java_name
+                ),
             )
             .with_rust(Some(r.origin.clone()))
             .note(format!(
@@ -245,7 +257,10 @@ fn check_method_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
     report.push(
         Diagnostic::error(
             "E041",
-            format!("Java method `{}` on `{class}` has no matching signature", r.java_name),
+            format!(
+                "Java method `{}` on `{class}` has no matching signature",
+                r.java_name
+            ),
         )
         .with_rust(Some(r.origin.clone()))
         .expected_found(format!("({eargs}){eret}"), found),
@@ -271,18 +286,19 @@ fn check_ctor_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
             .join(" | ")
     };
     report.push(
-        Diagnostic::error(
-            "E044",
-            format!("no constructor `({eargs})V` on `{class}`"),
-        )
-        .with_rust(Some(r.origin.clone()))
-        .expected_found(format!("({eargs})V"), found),
+        Diagnostic::error("E044", format!("no constructor `({eargs})V` on `{class}`"))
+            .with_rust(Some(r.origin.clone()))
+            .expected_found(format!("({eargs})V"), found),
     );
 }
 
 fn check_field_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
     let class = r.class_internal.replace('/', ".");
-    let by_name: Vec<&JavaFieldSig> = model.fields.iter().filter(|f| f.name == r.java_name).collect();
+    let by_name: Vec<&JavaFieldSig> = model
+        .fields
+        .iter()
+        .filter(|f| f.name == r.java_name)
+        .collect();
     if by_name.is_empty() {
         report.push(
             Diagnostic::error("E042", format!("no Java field `{}` on `{class}`", r.java_name))
@@ -291,13 +307,19 @@ fn check_field_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
         );
         return;
     }
-    let by_receiver: Vec<&&JavaFieldSig> =
-        by_name.iter().filter(|f| f.is_static == r.is_static).collect();
+    let by_receiver: Vec<&&JavaFieldSig> = by_name
+        .iter()
+        .filter(|f| f.is_static == r.is_static)
+        .collect();
     if by_receiver.is_empty() {
         report.push(
             Diagnostic::error(
                 "E042",
-                format!("no {} Java field `{}` on `{class}`", receiver_word(r.is_static), r.java_name),
+                format!(
+                    "no {} Java field `{}` on `{class}`",
+                    receiver_word(r.is_static),
+                    r.java_name
+                ),
             )
             .with_rust(Some(r.origin.clone()))
             .note(format!(
@@ -310,19 +332,112 @@ fn check_field_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
     let Some(expected) = r.field_ty.as_ref().and_then(|t| t.jni_field_descriptor()) else {
         return;
     };
-    if by_receiver.iter().any(|f| f.descriptor == expected) {
+    let matching: Vec<&JavaFieldSig> = by_receiver
+        .iter()
+        .filter(|f| f.descriptor == expected)
+        .map(|f| **f)
+        .collect();
+    if matching.is_empty() {
+        let found = by_receiver
+            .iter()
+            .map(|f| f.descriptor.clone())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        report.push(
+            Diagnostic::error(
+                "E043",
+                format!(
+                    "Java field `{}` on `{class}` has the wrong type",
+                    r.java_name
+                ),
+            )
+            .with_rust(Some(r.origin.clone()))
+            .expected_found(expected, found),
+        );
         return;
     }
-    let found = by_receiver
+    // The descriptor matches (both `long`). If the Rust side declares this field
+    // as a handle, a bare `long` is indistinguishable from any other handle on
+    // the wire, so the Java field must carry a matching `@Ref`/`@Mut`/`@Owned`
+    // annotation for the stored type to be checkable.
+    if let Some(IrType::Pointer(rust_ptr)) = r.field_ty.as_ref() {
+        check_field_handle_annotation(r, rust_ptr, &matching, &class, report);
+    }
+}
+
+/// Cross-check a Rust handle-typed field declaration against the `@Ref`/`@Mut`/
+/// `@Owned` annotation on the matching Java `long` field(s): a clean match if any
+/// agrees, **W005** if none is annotated, **E045** if an annotation is present
+/// but disagrees on kind/type (or nullability, for the borrow handles).
+fn check_field_handle_annotation(
+    r: &JavaRef,
+    rust_ptr: &Pointer,
+    matching: &[&JavaFieldSig],
+    class: &str,
+    report: &mut Report,
+) {
+    if matching
         .iter()
-        .map(|f| f.descriptor.clone())
+        .filter_map(|f| f.annotation.as_ref())
+        .any(|java_ptr| pointer_matches(rust_ptr, java_ptr))
+    {
+        return;
+    }
+    let annotated: Vec<&Pointer> = matching
+        .iter()
+        .filter_map(|f| f.annotation.as_ref())
+        .collect();
+    let expected = IrType::Pointer(rust_ptr.clone()).describe();
+    if annotated.is_empty() {
+        report.push(
+            Diagnostic::warning(
+                "W005",
+                format!(
+                    "Java field `{}` on `{class}` stores a `{}` handle but is not annotated",
+                    r.java_name,
+                    rust_ptr.kind.wrapper()
+                ),
+            )
+            .with_rust(Some(r.origin.clone()))
+            .help(format!(
+                "annotate the `long` field `{}(\"{}\")` so the stored handle type is cross-checked",
+                rust_ptr.kind.annotation(),
+                rust_ptr.rust_type
+            )),
+        );
+        return;
+    }
+    let found = annotated
+        .iter()
+        .map(|p| IrType::Pointer((*p).clone()).describe())
         .collect::<Vec<_>>()
         .join(" | ");
     report.push(
-        Diagnostic::error("E043", format!("Java field `{}` on `{class}` has the wrong type", r.java_name))
-            .with_rust(Some(r.origin.clone()))
-            .expected_found(expected, found),
+        Diagnostic::error(
+            "E045",
+            format!(
+                "Java field `{}` on `{class}` has a mismatched handle annotation",
+                r.java_name
+            ),
+        )
+        .with_rust(Some(r.origin.clone()))
+        .expected_found(expected, found)
+        .help("make the Java `@Ref`/`@Mut`/`@Owned` annotation match the Rust handle type"),
     );
+}
+
+/// Whether a Rust handle field type agrees with a Java field annotation. Mirrors
+/// the parameter-path rule in [`compare`]: kind and pointee type must match, and
+/// nullability is compared only for the borrow handles (`@Ref`/`@Mut`) — `JOwned`
+/// is internally nullable and never `Option`-wrapped, so its nullability is moot.
+fn pointer_matches(rust: &Pointer, java: &Pointer) -> bool {
+    if rust.kind != java.kind || rust.rust_type != java.rust_type {
+        return false;
+    }
+    match rust.kind {
+        PointerKind::Ref | PointerKind::Mut => rust.nullable == java.nullable,
+        PointerKind::Owned => true,
+    }
 }
 
 fn receiver_word(is_static: bool) -> &'static str {
@@ -519,7 +634,7 @@ mod tests {
     use crate::diagnostics::Report;
     use crate::ir::{
         IrType, JavaClassModel, JavaFieldSig, JavaLoc, JavaMethodSig, JavaRef, JavaRefKind,
-        MethodKey, Origin, Primitive, Receiver, Signature, SrcLoc,
+        MethodKey, Origin, Pointer, PointerKind, Primitive, Receiver, Signature, SrcLoc,
     };
     use std::path::PathBuf;
 
@@ -581,12 +696,20 @@ mod tests {
                 name: "counter".to_owned(),
                 is_static: true,
                 descriptor: "I".to_owned(),
+                annotation: None,
             }],
             constructors: vec!["I".to_owned()],
         }
     }
 
-    fn ref_(kind: JavaRefKind, name: &str, is_static: bool, params: Vec<IrType>, ret: IrType, field_ty: Option<IrType>) -> JavaRef {
+    fn ref_(
+        kind: JavaRefKind,
+        name: &str,
+        is_static: bool,
+        params: Vec<IrType>,
+        ret: IrType,
+        field_ty: Option<IrType>,
+    ) -> JavaRef {
         JavaRef {
             class_internal: "example/Foo".to_owned(),
             kind,
@@ -612,20 +735,59 @@ mod tests {
     #[test]
     fn matching_refs_clean() {
         let refs = vec![
-            ref_(JavaRefKind::Method, "doubled", true, vec![int()], int(), None),
-            ref_(JavaRefKind::Field, "counter", true, vec![], IrType::Void, Some(int())),
-            ref_(JavaRefKind::Constructor, "<init>", false, vec![int()], IrType::Void, None),
+            ref_(
+                JavaRefKind::Method,
+                "doubled",
+                true,
+                vec![int()],
+                int(),
+                None,
+            ),
+            ref_(
+                JavaRefKind::Field,
+                "counter",
+                true,
+                vec![],
+                IrType::Void,
+                Some(int()),
+            ),
+            ref_(
+                JavaRefKind::Constructor,
+                "<init>",
+                false,
+                vec![int()],
+                IrType::Void,
+                None,
+            ),
         ];
         let report = run_refs(&refs);
-        assert!(!report.has_errors(), "expected clean:\n{}", report.render_human());
+        assert!(
+            !report.has_errors(),
+            "expected clean:\n{}",
+            report.render_human()
+        );
         assert_eq!(report.diagnostics.len(), 0);
     }
 
     #[test]
     fn missing_method_is_e040_and_bad_signature_is_e041() {
         let refs = vec![
-            ref_(JavaRefKind::Method, "tripled", true, vec![int()], int(), None),
-            ref_(JavaRefKind::Method, "doubled", true, vec![int(), int()], int(), None),
+            ref_(
+                JavaRefKind::Method,
+                "tripled",
+                true,
+                vec![int()],
+                int(),
+                None,
+            ),
+            ref_(
+                JavaRefKind::Method,
+                "doubled",
+                true,
+                vec![int(), int()],
+                int(),
+                None,
+            ),
         ];
         let report = run_refs(&refs);
         assert!(report.has_code("E040"), "{}", report.render_human());
@@ -635,16 +797,32 @@ mod tests {
     #[test]
     fn field_and_constructor_problems() {
         let refs = vec![
-            ref_(JavaRefKind::Field, "missing", true, vec![], IrType::Void, Some(int())),
+            ref_(
+                JavaRefKind::Field,
+                "missing",
+                true,
+                vec![],
+                IrType::Void,
+                Some(int()),
+            ),
             ref_(
                 JavaRefKind::Field,
                 "counter",
                 true,
                 vec![],
                 IrType::Void,
-                Some(IrType::JavaObject { class: "java/lang/String".to_owned() }),
+                Some(IrType::JavaObject {
+                    class: "java/lang/String".to_owned(),
+                }),
             ),
-            ref_(JavaRefKind::Constructor, "<init>", false, vec![int(), int()], IrType::Void, None),
+            ref_(
+                JavaRefKind::Constructor,
+                "<init>",
+                false,
+                vec![int(), int()],
+                IrType::Void,
+                None,
+            ),
         ];
         let report = run_refs(&refs);
         assert!(report.has_code("E042"), "{}", report.render_human()); // missing field
@@ -654,7 +832,14 @@ mod tests {
 
     #[test]
     fn unloaded_class_is_w004() {
-        let mut r = ref_(JavaRefKind::Method, "doubled", true, vec![int()], int(), None);
+        let mut r = ref_(
+            JavaRefKind::Method,
+            "doubled",
+            true,
+            vec![int()],
+            int(),
+            None,
+        );
         r.class_internal = "example/NotLoaded".to_owned();
         let report = run_refs(&[r]);
         assert!(report.has_code("W004"), "{}", report.render_human());
@@ -668,5 +853,93 @@ mod tests {
             java_sig("Java_example_Foo_b", "b"),
         ];
         assert!(!check(&java, &[]).has_code("E005"));
+    }
+
+    // --- Field handle-annotation cross-check (Rust handle field ↔ Java @Owned/…) -
+
+    fn owned(rust_type: &str, nullable: bool) -> Pointer {
+        Pointer {
+            kind: PointerKind::Owned,
+            rust_type: rust_type.to_owned(),
+            nullable,
+        }
+    }
+
+    /// A class with a single instance `long handle` field carrying `annotation`.
+    fn handle_model(annotation: Option<Pointer>) -> JavaClassModel {
+        JavaClassModel {
+            internal_name: "example/Foo".to_owned(),
+            methods: vec![],
+            fields: vec![JavaFieldSig {
+                name: "handle".to_owned(),
+                is_static: false,
+                descriptor: "J".to_owned(),
+                annotation,
+            }],
+            constructors: vec![],
+        }
+    }
+
+    fn run_refs_against(refs: &[JavaRef], model: JavaClassModel) -> Report {
+        let mut report = Report::default();
+        check_java_refs(refs, &[model], &mut report);
+        report
+    }
+
+    fn handle_field_ref() -> JavaRef {
+        ref_(
+            JavaRefKind::Field,
+            "handle",
+            false,
+            vec![],
+            IrType::Void,
+            Some(IrType::Pointer(owned("Box<String>", false))),
+        )
+    }
+
+    #[test]
+    fn handle_field_matching_annotation_is_clean() {
+        // `@Owned` nullability is intentionally not compared: Java's default
+        // `nullable = true` must still match the bare Rust `JOwned`.
+        let report = run_refs_against(
+            &[handle_field_ref()],
+            handle_model(Some(owned("Box<String>", true))),
+        );
+        assert!(
+            !report.has_errors(),
+            "expected clean:\n{}",
+            report.render_human()
+        );
+        assert_eq!(report.diagnostics.len(), 0);
+    }
+
+    #[test]
+    fn unannotated_handle_field_is_w005() {
+        let report = run_refs_against(&[handle_field_ref()], handle_model(None));
+        assert!(report.has_code("W005"), "{}", report.render_human());
+        assert!(!report.has_errors(), "W005 is a warning");
+    }
+
+    #[test]
+    fn mismatched_handle_annotation_is_e045() {
+        // Java declares the wrong pointee type.
+        let report = run_refs_against(
+            &[handle_field_ref()],
+            handle_model(Some(owned("Box<u64>", true))),
+        );
+        assert!(report.has_code("E045"), "{}", report.render_human());
+        assert!(report.has_errors());
+    }
+
+    #[test]
+    fn mismatched_handle_kind_is_e045() {
+        // Java annotates the handle field `@Ref` where Rust stores a `JOwned`.
+        let java_ref = Pointer {
+            kind: PointerKind::Ref,
+            rust_type: "Box<String>".to_owned(),
+            nullable: false,
+        };
+        let report = run_refs_against(&[handle_field_ref()], handle_model(Some(java_ref)));
+        assert!(report.has_code("E045"), "{}", report.render_human());
     }
 }

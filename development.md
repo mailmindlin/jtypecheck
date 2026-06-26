@@ -48,6 +48,7 @@ it, so the checker has something concrete to accept or reject:
 | `incorrect/`       | `Incorrect.java`       | `wrong.rs`   | Hand-written `Java_*` exports, one diagnostic per method |
 | `incorrect_macros/`| `IncorrectMacros.java` | `wrong.rs`   | Macro-declared natives across the three macro forms   |
 | `incorrect_calls/` | `IncorrectCalls.java`  | `wrong.rs`   | Rust→Java call bindings (methods/fields/constructors, E040–E044/W004) |
+| `field_handles/`   | `FieldHandles.java`    | `wrong.rs`   | Handle fields: `@Owned`/`@Ref`/`@Mut` annotation vs Rust handle type (E045 mismatch, W005 unannotated) |
 | `overloaded/`      | *(uses `Overloaded`)*  | `natives.rs` | **Positive:** overloaded `native_method!` natives resolve cleanly |
 
 The `*.rs` files are **not compiled** — the Rust loader parses them with `syn`

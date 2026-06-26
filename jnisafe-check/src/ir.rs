@@ -285,6 +285,10 @@ pub struct JavaFieldSig {
     pub is_static: bool,
     /// Field type descriptor, e.g. `"I"`, `"Ljava/lang/String;"`.
     pub descriptor: String,
+    /// The `@Ref`/`@Mut`/`@Owned` annotation on the field's type, if any —
+    /// present when the `long` field stores a jnisafe handle. `None` for an
+    /// unannotated field.
+    pub annotation: Option<Pointer>,
 }
 
 #[cfg(test)]
@@ -300,7 +304,9 @@ mod tests {
     #[test]
     fn field_descriptors_match_jvm_form() {
         assert_eq!(
-            IrType::Primitive(Primitive::Int).jni_field_descriptor().as_deref(),
+            IrType::Primitive(Primitive::Int)
+                .jni_field_descriptor()
+                .as_deref(),
             Some("I")
         );
         assert_eq!(
@@ -328,7 +334,10 @@ mod tests {
         assert_eq!(owned.jni_field_descriptor().as_deref(), Some("J"));
         // Unencodable types.
         assert_eq!(IrType::Void.jni_field_descriptor(), None);
-        assert_eq!(IrType::Unsupported("Foo".to_owned()).jni_field_descriptor(), None);
+        assert_eq!(
+            IrType::Unsupported("Foo".to_owned()).jni_field_descriptor(),
+            None
+        );
     }
 
     #[test]

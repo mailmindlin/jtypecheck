@@ -2,11 +2,11 @@
 //!
 //! Drives the public library API (the same surface as `tests/e2e.rs`) to show
 //! the whole point of the checker in one run:
-//!   * a **positive** phase — the five correct example classes match `example/rust`
+//!   * a **positive** phase — the correct example classes match `example/rust`
 //!     cleanly (zero diagnostics), and
-//!   * three **negative** phases — the intentionally-wrong `Incorrect` /
-//!     `IncorrectMacros` / `IncorrectCalls` classes are rejected with the *exact*
-//!     diagnostics we expect.
+//!   * four **negative** phases — the intentionally-wrong `Incorrect` /
+//!     `IncorrectMacros` / `IncorrectCalls` / `FieldHandles` classes are rejected
+//!     with the *exact* diagnostics we expect.
 //!
 //! Paths are resolved relative to the current working directory; pixi runs tasks
 //! from the workspace root, and `pixi run demo` depends on `fixtures`, which
@@ -60,6 +60,7 @@ fn main() -> ExitCode {
         "example/rust",
         &[
             "jnisafe-check/tests/fixtures/classes/example/HandWritten.class",
+            "jnisafe-check/tests/fixtures/classes/example/Document.class",
             "jnisafe-check/tests/fixtures/classes/example/Mangle.class",
             "jnisafe-check/tests/fixtures/classes/example/NativeMethod.class",
             "jnisafe-check/tests/fixtures/classes/example/BindType.class",
@@ -119,6 +120,18 @@ fn main() -> ExitCode {
         &Expect {
             codes: &["E040", "E041", "E042", "E043", "E044", "W004"],
             errors: 5,
+            warnings: 1,
+        },
+    );
+
+    // --- Phase 5: negative (Rust→Java handle fields) ------------------------
+    ok &= negative_phase(
+        "negative: handle fields — FieldHandles annotations should be checked",
+        "jnisafe-check/tests/fixtures/field_handles",
+        "jnisafe-check/tests/fixtures/classes/example/FieldHandles.class",
+        &Expect {
+            codes: &["W005", "E045"],
+            errors: 1,
             warnings: 1,
         },
     );

@@ -77,8 +77,8 @@ where
         } else if path.extension().is_some_and(|e| e == "jar") {
             let file =
                 std::fs::File::open(path).map_err(|e| JavaLoadError::Io(path.to_path_buf(), e))?;
-            let mut zip =
-                zip::ZipArchive::new(file).map_err(|e| JavaLoadError::Jar(path.to_path_buf(), e))?;
+            let mut zip = zip::ZipArchive::new(file)
+                .map_err(|e| JavaLoadError::Jar(path.to_path_buf(), e))?;
             for i in 0..zip.len() {
                 let mut entry = zip
                     .by_index(i)
@@ -139,6 +139,7 @@ fn build_model(class: &cafebabe::ClassFile) -> JavaClassModel {
             name: fd.name.to_string(),
             is_static: fd.access_flags.contains(FieldAccessFlags::STATIC),
             descriptor: fd.descriptor.to_string(),
+            annotation: field_pointer_annotation(&fd.attributes),
         })
         .collect();
     JavaClassModel {
@@ -266,6 +267,38 @@ fn collect_pointer_annotations(attrs: &[cafebabe::attributes::AttributeInfo]) ->
         }
     }
     result
+}
+
+/// Recover a top-level `@Ref`/`@Mut`/`@Owned` annotation on a *field*'s type, if
+/// any. A field-declaration type annotation uses target_type `0x13`, which
+/// cafebabe (like a method return, `0x14`) represents as the empty target — so
+/// we accept [`TypeAnnotationTarget::Empty`]. Annotation kind/type validation
+/// (e.g. it must sit on a `long`) is left to the cross-check; here we only
+/// surface what the field declares.
+fn field_pointer_annotation(attrs: &[cafebabe::attributes::AttributeInfo]) -> Option<Pointer> {
+    for a in attrs {
+        let tas: &[TypeAnnotation] = match &a.data {
+            AttributeData::RuntimeInvisibleTypeAnnotations(v)
+            | AttributeData::RuntimeVisibleTypeAnnotations(v) => v,
+            _ => continue,
+        };
+        for ta in tas {
+            if !ta.target_path.is_empty() || !matches!(ta.target_type, TypeAnnotationTarget::Empty)
+            {
+                continue;
+            }
+            let Some(kind) = pointer_kind(&annotation_class(&ta.annotation.type_descriptor)) else {
+                continue;
+            };
+            let (rust_type, nullable) = read_members(&ta.annotation);
+            return Some(Pointer {
+                kind,
+                rust_type,
+                nullable,
+            });
+        }
+    }
+    None
 }
 
 /// Extract `value` (the Rust type, normalized) and `nullable` (default true).

@@ -61,6 +61,7 @@ fn correct_passes() {
         example_rust(),
         vec![
             class("tests/fixtures/classes/example/HandWritten.class"),
+            class("tests/fixtures/classes/example/Document.class"),
             class("tests/fixtures/classes/example/Mangle.class"),
             class("tests/fixtures/classes/example/NativeMethod.class"),
             class("tests/fixtures/classes/example/BindType.class"),
@@ -105,7 +106,9 @@ fn incorrect_macros_report_expected_diagnostics() {
     // diagnostic per deliberately-wrong method across the three macro forms.
     let cfg = config(
         fixture("tests/fixtures/incorrect_macros"),
-        vec![class("tests/fixtures/classes/example/IncorrectMacros.class")],
+        vec![class(
+            "tests/fixtures/classes/example/IncorrectMacros.class",
+        )],
     );
     let report = run(&cfg).expect("run");
 
@@ -141,6 +144,33 @@ fn incorrect_calls_report_expected_diagnostics() {
     }
     assert!(report.has_errors());
     assert_eq!(report.error_count(), 5);
+    assert_eq!(report.warning_count(), 1);
+}
+
+#[test]
+fn field_handle_annotations_report_expected_diagnostics() {
+    // The Rust→Java direction for *handle fields*: `bind_java_type!`'s
+    // `fields { … }` declares `long` fields as `JOwned`/`JRef`/`JMut` handles, and
+    // each is cross-checked against the Java field's `@Owned`/`@Ref`/`@Mut`
+    // annotation. `cached` matches cleanly; `bare` is an unannotated handle field
+    // (W005); `wrong` is annotated with the wrong pointee type (E045).
+    let cfg = config(
+        fixture("tests/fixtures/field_handles"),
+        vec![class("tests/fixtures/classes/example/FieldHandles.class")],
+    );
+    let report = run(&cfg).expect("run");
+
+    for code in ["W005", "E045"] {
+        assert!(
+            report.has_code(code),
+            "missing {code}; report was:\n{}",
+            report.render_human()
+        );
+    }
+    // `cached` is a clean match: no field existence/type errors fire.
+    assert!(!report.has_code("E042"), "{}", report.render_human());
+    assert!(!report.has_code("E043"), "{}", report.render_human());
+    assert_eq!(report.error_count(), 1);
     assert_eq!(report.warning_count(), 1);
 }
 

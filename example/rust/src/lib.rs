@@ -13,6 +13,10 @@
 //! * [`bind_type`] — `bind_java_type!`; the same owned subset **plus** the
 //!   Rust→Java call direction (methods/fields/constructors).
 //! * [`overloaded`] — two same-named natives resolving to the long mangled form.
+//! * [`document`] — the same handle stored in a Java *field* across calls rather
+//!   than passed per-call: the `Document` class extends the `NativeObject` base
+//!   class so the field is guarded by a read/write lock, and the natives are the
+//!   ordinary parameter path (`@Ref`/`@Mut`/`@Owned`).
 //!
 //! Built as a `cdylib`, this is also a runnable native library: `example.Main`
 //! (`System.loadLibrary("example")`) exercises every class. `hand_written`,
@@ -24,6 +28,7 @@ use std::ffi::c_void;
 use jni::{JavaVM, jni_str, sys};
 
 pub mod bind_type;
+pub mod document;
 pub mod hand_written;
 pub mod mangle;
 pub mod native_method;
@@ -34,8 +39,18 @@ pub mod overloaded;
 /// they export no `Java_*` symbol — they're built for `RegisterNatives`.
 ///
 /// Called by the JVM when `System.loadLibrary("example")` loads this cdylib.
+///
+/// # Safety
+///
+/// `unsafe` because the JVM-dictated `JNI_OnLoad` signature takes a raw
+/// `*mut JavaVM` that this function dereferences. The JVM only ever calls it
+/// with the live `JavaVM` pointer for the loading VM, which satisfies the
+/// contract; it must not be called by hand with anything else.
 #[unsafe(no_mangle)]
-pub extern "system" fn JNI_OnLoad(vm: *mut sys::JavaVM, _reserved: *mut c_void) -> sys::jint {
+pub unsafe extern "system" fn JNI_OnLoad(
+    vm: *mut sys::JavaVM,
+    _reserved: *mut c_void,
+) -> sys::jint {
     // SAFETY: `vm` is the live `JavaVM` the JVM hands to `JNI_OnLoad`.
     let vm = unsafe { JavaVM::from_raw(vm) };
     let registered = vm.attach_current_thread(|env| -> jni::errors::Result<()> {

@@ -569,9 +569,9 @@ fn block_keyword(entry: &TokenStream) -> Option<(String, TokenStream)> {
         next = it.next()?;
     }
     match next {
-        TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Brace => Some((
-            keyword, g.stream(),
-        )),
+        TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Brace => {
+            Some((keyword, g.stream()))
+        }
         _ => None,
     }
 }
