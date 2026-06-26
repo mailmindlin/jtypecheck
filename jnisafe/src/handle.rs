@@ -34,7 +34,7 @@ impl<T: IntoJavaPtr> Deref for JRef<'_, T> {
     type Target = T::Target;
 
     fn deref(&self) -> &Self::Target {
-        rt_validate!(self.internal.get() as usize, T::Target, "JRef::deref");
+        rt_validate!(self.internal, T::Target, "JRef::deref");
         let ptr = from_exposed_jlong::<T::Target>(self.internal);
         // Safety: the address came from a non-null pointer whose provenance was
         // exposed when the object was handed to Java, and Java guarantees it
@@ -63,7 +63,7 @@ pub struct JMut<'local, T: IntoJavaPtr> {
 impl<T: IntoJavaPtr> Deref for JMut<'_, T> {
     type Target = T::Target;
     fn deref(&self) -> &Self::Target {
-        rt_validate!(self.internal.get() as usize, T::Target, "JMut::deref");
+        rt_validate!(self.internal, T::Target, "JMut::deref");
         let ptr = from_exposed_jlong::<T::Target>(self.internal);
         // Safety: see `JRef::deref`.
         unsafe { &*ptr }
@@ -72,7 +72,7 @@ impl<T: IntoJavaPtr> Deref for JMut<'_, T> {
 
 impl<T: IntoJavaPtrMut> DerefMut for JMut<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        rt_validate!(self.internal.get() as usize, T::Target, "JMut::deref_mut");
+        rt_validate!(self.internal, T::Target, "JMut::deref_mut");
         let mut ptr = from_exposed_jlong_mut::<T::Target>(self.internal);
         // Safety: `T: IntoJavaPtrMut` guarantees exclusive ownership, and Java's
         // lock discipline guarantees we hold the only mutable handle for the
@@ -90,7 +90,7 @@ impl<T: IntoJavaPtrMut> JMut<'_, T> {
     /// This is an opt-in, checked alternative to plain [`DerefMut`]; `*m = x`
     /// via `DerefMut` is left unchanged and stays unchecked for aliasing.
     pub fn borrow_mut(&mut self) -> MutGuard<'_, T> {
-        rt_begin_guard!(self.internal.get() as usize, T::Target);
+        rt_begin_guard!(self.internal, T::Target);
         let ptr = from_exposed_jlong_mut::<T::Target>(self.internal);
         MutGuard {
             ptr,
@@ -165,8 +165,8 @@ impl<T: IntoJavaPtr> JOwned<T> {
     pub fn into_inner(self) -> Option<T> {
         let this = ManuallyDrop::new(self);
         let internal = this.internal?;
-        rt_validate!(internal.get() as usize, T::Target, "JOwned::into_inner");
-        rt_deregister!(internal.get() as usize, "JOwned::into_inner");
+        rt_validate!(internal, T::Target, "JOwned::into_inner");
+        rt_deregister!(internal, "JOwned::into_inner");
         let mut ptr = from_exposed_jlong_mut::<T::Target>(internal);
         // Safety: a non-null `internal` was produced by `From`, which stored
         // a pointer from `IntoJavaPtr::to_raw`; we reconstruct exactly once
@@ -178,7 +178,7 @@ impl<T: IntoJavaPtr> JOwned<T> {
     #[must_use]
     pub fn get(&self) -> Option<&T::Target> {
         let internal = self.internal?;
-        rt_validate!(internal.get() as usize, T::Target, "JOwned::get");
+        rt_validate!(internal, T::Target, "JOwned::get");
         let ptr = from_exposed_jlong::<T::Target>(internal);
         unsafe { ptr.as_ref() }
     }
@@ -186,7 +186,7 @@ impl<T: IntoJavaPtr> JOwned<T> {
     /// Get a mutable reference to the contained value
     pub fn get_mut(&mut self) -> Option<&mut T::Target> {
         let internal = self.internal?;
-        rt_validate!(internal.get() as usize, T::Target, "JOwned::get_mut");
+        rt_validate!(internal, T::Target, "JOwned::get_mut");
         let mut ptr = from_exposed_jlong_mut::<T::Target>(internal);
         Some(unsafe { ptr.as_mut() })
     }
@@ -201,7 +201,7 @@ impl<T: IntoJavaPtr> JOwned<T> {
         T: IntoJavaPtrMut,
     {
         let internal = self.internal?;
-        rt_begin_guard!(internal.get() as usize, T::Target);
+        rt_begin_guard!(internal, T::Target);
         let ptr = from_exposed_jlong_mut::<T::Target>(internal);
         Some(MutGuard {
             ptr,
@@ -223,7 +223,7 @@ impl<R: IntoJavaPtr> From<R> for JOwned<R> {
         // ownership is recovered exactly once via `take`/`Drop`.
         let raw = unsafe { value.to_raw() };
         let internal = expose_as_jlong(raw);
-        rt_register!(internal.get() as usize, R::Target);
+        rt_register!(internal, R::Target);
         Self {
             internal: Some(internal),
             ty: PhantomData,
@@ -235,7 +235,7 @@ impl<T: IntoJavaPtr> Deref for JOwned<T> {
     type Target = T::Target;
     fn deref(&self) -> &Self::Target {
         let internal = self.internal.expect("deref of null JOwned");
-        rt_validate!(internal.get() as usize, T::Target, "JOwned::deref");
+        rt_validate!(internal, T::Target, "JOwned::deref");
         let ptr = from_exposed_jlong::<T::Target>(internal);
         // Safety: non-null `internal` points at a live object owned by `self`.
         unsafe { &*ptr }
@@ -245,7 +245,7 @@ impl<T: IntoJavaPtr> Deref for JOwned<T> {
 impl<T: IntoJavaPtrMut> DerefMut for JOwned<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         let internal = self.internal.expect("deref of null JOwned");
-        rt_validate!(internal.get() as usize, T::Target, "JOwned::deref_mut");
+        rt_validate!(internal, T::Target, "JOwned::deref_mut");
         let mut ptr = from_exposed_jlong_mut::<T::Target>(internal);
         // Safety: `T: IntoJavaPtrMut` guarantees exclusive ownership and `self`
         // owns the live object.
@@ -256,8 +256,8 @@ impl<T: IntoJavaPtrMut> DerefMut for JOwned<T> {
 impl<T: IntoJavaPtr> Drop for JOwned<T> {
     fn drop(&mut self) {
         if let Some(internal) = self.internal {
-            rt_validate!(internal.get() as usize, T::Target, "JOwned::drop");
-            rt_deregister!(internal.get() as usize, "JOwned::drop");
+            rt_validate!(internal, T::Target, "JOwned::drop");
+            rt_deregister!(internal, "JOwned::drop");
             let ptr = from_exposed_jlong_mut::<T::Target>(internal);
             // Safety: non-null `internal` was produced by `From` and is dropped
             // exactly once (here, unless previously consumed by `take`, which

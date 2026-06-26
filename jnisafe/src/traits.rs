@@ -85,19 +85,31 @@ pub(crate) fn expose_as_jlong<T>(ptr: NonNull<T>) -> NonZero<jlong> {
     NonZero::new(raw).unwrap()
 }
 
+/// Recover the machine address from an exposed `jlong` handle.
+///
+/// [`expose_as_jlong`] widened a `usize` address into the 64-bit `jlong`. On
+/// 64-bit targets `usize` is also 64-bit, so this round-trip is lossless. On
+/// 32-bit targets a `jlong` whose high bits are set could never have been a
+/// pointer we produced, so `try_into` rejects it rather than silently
+/// truncating to a bogus 32-bit address.
+pub(crate) fn jlong_to_addr(handle: NonZero<jlong>) -> NonZero<usize> {
+    handle
+        .cast_unsigned()
+        .try_into()
+        .expect("jlong handle address does not fit in a pointer")
+}
+
 /// Reconstruct a shared pointer from an exposed `jlong` address.
-pub(crate) fn from_exposed_jlong<T>(addr: NonZero<jlong>) -> *const T {
-    let addr = addr.cast_unsigned();
-    rt_check_align!(addr.get() as usize, T);
-    std::ptr::with_exposed_provenance::<T>(addr.get() as usize)
+pub(crate) fn from_exposed_jlong<T>(handle: NonZero<jlong>) -> *const T {
+    let addr = jlong_to_addr(handle);
+    rt_check_align!(addr.get(), T);
+    std::ptr::with_exposed_provenance::<T>(addr.get())
 }
 
 /// Reconstruct a mutable pointer from an exposed `jlong` address.
-pub(crate) fn from_exposed_jlong_mut<T>(addr: NonZero<jlong>) -> NonNull<T> {
-    let addr = addr.cast_unsigned();
-    rt_check_align!(addr.get() as usize, T);
-    let addr: NonZero<usize> = addr.try_into().unwrap();
-
+pub(crate) fn from_exposed_jlong_mut<T>(handle: NonZero<jlong>) -> NonNull<T> {
+    let addr = jlong_to_addr(handle);
+    rt_check_align!(addr.get(), T);
     NonNull::with_exposed_provenance(addr)
 }
 

@@ -21,13 +21,19 @@
 //
 // These `macro_rules!` are defined here, ahead of the `mod` declarations below,
 // so the `traits`/`handle` modules see them in textual scope without `#[macro_use]`.
+//
+// The handle-keyed macros (`rt_register`/`rt_validate`/`rt_deregister`/
+// `rt_begin_guard`) take the raw `NonZero<jlong>` handle and derive the `usize`
+// registry key through `traits::jlong_to_addr`, which validates that the
+// address fits in a pointer. `rt_check_align`/`rt_end_guard` instead take an
+// already-recovered `usize` address.
 
 /// Register a freshly-created owned handle (`JOwned::from`).
 macro_rules! rt_register {
-    ($addr:expr, $ty:ty) => {{
+    ($handle:expr, $ty:ty) => {{
         #[cfg(debug_assertions)]
         $crate::registry::register(
-            $addr,
+            $crate::traits::jlong_to_addr($handle).get(),
             ::std::any::TypeId::of::<$ty>(),
             ::std::any::type_name::<$ty>(),
         );
@@ -36,10 +42,10 @@ macro_rules! rt_register {
 
 /// Validate that a handle is live and of the expected type before use.
 macro_rules! rt_validate {
-    ($addr:expr, $ty:ty, $op:expr) => {{
+    ($handle:expr, $ty:ty, $op:expr) => {{
         #[cfg(debug_assertions)]
         $crate::registry::validate(
-            $addr,
+            $crate::traits::jlong_to_addr($handle).get(),
             ::std::any::TypeId::of::<$ty>(),
             ::std::any::type_name::<$ty>(),
             $op,
@@ -49,18 +55,18 @@ macro_rules! rt_validate {
 
 /// Drop a live handle's registration (`take` / `Drop`); double-free detector.
 macro_rules! rt_deregister {
-    ($addr:expr, $op:expr) => {{
+    ($handle:expr, $op:expr) => {{
         #[cfg(debug_assertions)]
-        $crate::registry::deregister($addr, $op);
+        $crate::registry::deregister($crate::traits::jlong_to_addr($handle).get(), $op);
     }};
 }
 
 /// Take the exclusive mutable-borrow flag for a `borrow_mut()` guard.
 macro_rules! rt_begin_guard {
-    ($addr:expr, $ty:ty) => {{
+    ($handle:expr, $ty:ty) => {{
         #[cfg(debug_assertions)]
         $crate::registry::begin_mut_guard(
-            $addr,
+            $crate::traits::jlong_to_addr($handle).get(),
             ::std::any::TypeId::of::<$ty>(),
             ::std::any::type_name::<$ty>(),
         );
