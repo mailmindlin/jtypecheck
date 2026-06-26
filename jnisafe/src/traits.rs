@@ -71,24 +71,30 @@ pub unsafe trait IntoJavaPtrMut: IntoJavaPtr {}
 unsafe impl<T: Send + 'static> IntoJavaPtrMut for Box<T> {}
 
 /// Assert at compile time that a `usize` address fits in a `jlong`.
-const _: () = assert!(size_of::<jlong>() >= size_of::<usize>());
+const _: () = assert!(size_of::<jlong>() >= size_of::<usize>(), "target pointer must fit within jlong");
 
 /// Convert a raw pointer into a `jlong`, *exposing* its provenance so the
 /// address can later be turned back into a usable pointer with
 /// [`with_exposed_provenance`](std::ptr::with_exposed_provenance).
 pub(crate) fn expose_as_jlong<T>(ptr: NonNull<T>) -> NonZero<jlong> {
-    let raw = ptr.as_ptr().expose_provenance() as jlong;
+    let raw = ptr
+        .as_ptr()
+        .expose_provenance()
+        .cast_signed()
+        as jlong;
     NonZero::new(raw).unwrap()
 }
 
 /// Reconstruct a shared pointer from an exposed `jlong` address.
 pub(crate) fn from_exposed_jlong<T>(addr: NonZero<jlong>) -> *const T {
+    let addr = addr.cast_unsigned();
     rt_check_align!(addr.get() as usize, T);
     std::ptr::with_exposed_provenance::<T>(addr.get() as usize)
 }
 
 /// Reconstruct a mutable pointer from an exposed `jlong` address.
 pub(crate) fn from_exposed_jlong_mut<T>(addr: NonZero<jlong>) -> NonNull<T> {
+    let addr = addr.cast_unsigned();
     rt_check_align!(addr.get() as usize, T);
     let addr: NonZero<usize> = addr.try_into().unwrap();
 

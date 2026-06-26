@@ -175,6 +175,7 @@ impl<T: IntoJavaPtr> JOwned<T> {
     }
 
     /// Get a reference to the contained value
+    #[must_use]
     pub fn get(&self) -> Option<&T::Target> {
         let internal = self.internal?;
         rt_validate!(internal.get() as usize, T::Target, "JOwned::get");
