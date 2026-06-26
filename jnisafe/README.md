@@ -27,6 +27,26 @@ fn read(ptr: JRef<'_, Box<String>>) -> usize {
 }
 ```
 
+### With the jni 0.22.4 macros
+
+These wrappers work with the jni crate's macros, too. A `#[jni_mangle]` function
+keeps its real signature, so all three wrappers are used as-is. For
+`native_method! { … }` / `bind_java_type! { … }`, carry an **owned** handle
+through with a `type_map` entry — `#[repr(transparent)]` over `jlong` is exactly
+what the `unsafe … => long` mapping needs:
+
+```rust
+native_method! {
+    java_type = "example.Foo",
+    type_map = { unsafe JOwned<Box<String>> => long },
+    static fn create(value: JString) -> JOwned<Box<String>>,
+}
+```
+
+The borrowed `JRef` / `JMut` carry a `'local` lifetime that those macros'
+`const`-evaluated context can't name, so reach for `#[jni_mangle]` when a native
+takes a borrow handle.
+
 ## Runtime validation (debug builds)
 
 The static checker only sees signatures; it can't know *which* handle Java
