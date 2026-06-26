@@ -105,6 +105,45 @@ impl IrType {
             IrType::Unsupported(s) => format!("unsupported({s})"),
         }
     }
+
+    /// The raw JVM field descriptor for this type (e.g. `I`, `Ljava/lang/String;`,
+    /// `[I`), or `None` when the type can't be encoded as one. Mirrors
+    /// `java_loader`'s `FieldDescriptor::to_string()` exactly so the two sides
+    /// agree on overload-mangling and signature comparison — note `JOwned`/`JRef`/
+    /// `JMut` handles are bare `long`s on the wire, hence `J`. The result is the
+    /// *unescaped* form; `mangle::mangle` applies the `_1`/`_2`/`_3` escaping.
+    pub fn jni_field_descriptor(&self) -> Option<String> {
+        Some(match self {
+            IrType::Primitive(p) => match p {
+                Primitive::Boolean => "Z",
+                Primitive::Byte => "B",
+                Primitive::Char => "C",
+                Primitive::Short => "S",
+                Primitive::Int => "I",
+                Primitive::Long => "J",
+                Primitive::Float => "F",
+                Primitive::Double => "D",
+            }
+            .to_owned(),
+            // Arrays are stored as their full descriptor already (e.g. `[I`,
+            // `[Ljava/lang/String;`); plain objects as the internal name.
+            IrType::JavaObject { class } if class.starts_with('[') => class.clone(),
+            IrType::JavaObject { class } => format!("L{class};"),
+            // A handle is a `long` at the FFI boundary.
+            IrType::Pointer(_) => "J".to_owned(),
+            IrType::Void | IrType::Misannotated { .. } | IrType::Unsupported(_) => return None,
+        })
+    }
+}
+
+/// Concatenated parameter descriptors (no parens, no return), matching
+/// `java_loader::arg_descriptor`. `None` if any parameter can't be encoded.
+pub fn args_descriptor(params: &[IrType]) -> Option<String> {
+    let mut out = String::new();
+    for p in params {
+        out.push_str(&p.jni_field_descriptor()?);
+    }
+    Some(out)
 }
 
 /// A structural problem with a Rust `Java_*` function that stops it from being
@@ -175,4 +214,139 @@ pub struct Signature {
     /// export; always `None` for Java signatures and well-formed Rust exports.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub export_problem: Option<RustExportProblem>,
+}
+
+/// Which kind of Java member a [`JavaRef`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JavaRefKind {
+    Method,
+    Constructor,
+    Field,
+}
+
+impl JavaRefKind {
+    /// Human noun for diagnostics.
+    pub fn noun(self) -> &'static str {
+        match self {
+            JavaRefKind::Method => "method",
+            JavaRefKind::Constructor => "constructor",
+            JavaRefKind::Field => "field",
+        }
+    }
+}
+
+/// A `bind_java_type!` `methods`/`fields`/`constructors` entry: the Rust side
+/// asserts the bound Java class has this member and *calls* it (the Rust→Java
+/// direction, the reverse of a native method). The checker verifies it against
+/// the loaded [`JavaClassModel`].
+#[derive(Debug, Clone, Serialize)]
+pub struct JavaRef {
+    /// Internal binary class name, e.g. `example/BindTypeExample`.
+    pub class_internal: String,
+    pub kind: JavaRefKind,
+    /// Java member name (camel-cased / overridden; `<init>` for a constructor).
+    pub java_name: String,
+    pub is_static: bool,
+    /// Method / constructor parameters (empty for a field).
+    pub params: Vec<IrType>,
+    /// Method return type (`Void` for a constructor; unused for a field).
+    pub ret: IrType,
+    /// Field type — `Some` only for [`JavaRefKind::Field`].
+    pub field_ty: Option<IrType>,
+    pub origin: SrcLoc,
+}
+
+/// The callable surface of a Java class, used to verify [`JavaRef`]s. Built by
+/// the Java loader from all (not just native) methods, fields, and `<init>`s.
+#[derive(Debug, Clone, Serialize)]
+pub struct JavaClassModel {
+    /// Internal binary name, e.g. `example/BindTypeExample`.
+    pub internal_name: String,
+    pub methods: Vec<JavaMethodSig>,
+    pub fields: Vec<JavaFieldSig>,
+    /// `<init>` argument descriptors, e.g. `"I"` for a `(int)` constructor.
+    pub constructors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JavaMethodSig {
+    pub name: String,
+    pub is_static: bool,
+    /// Concatenated parameter descriptors, e.g. `"ILjava/lang/String;"`.
+    pub arg_descriptor: String,
+    /// Return descriptor, e.g. `"I"` or `"V"`.
+    pub ret_descriptor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JavaFieldSig {
+    pub name: String,
+    pub is_static: bool,
+    /// Field type descriptor, e.g. `"I"`, `"Ljava/lang/String;"`.
+    pub descriptor: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(class: &str) -> IrType {
+        IrType::JavaObject {
+            class: class.to_owned(),
+        }
+    }
+
+    #[test]
+    fn field_descriptors_match_jvm_form() {
+        assert_eq!(
+            IrType::Primitive(Primitive::Int).jni_field_descriptor().as_deref(),
+            Some("I")
+        );
+        assert_eq!(
+            IrType::Primitive(Primitive::Long)
+                .jni_field_descriptor()
+                .as_deref(),
+            Some("J")
+        );
+        assert_eq!(
+            obj("java/lang/String").jni_field_descriptor().as_deref(),
+            Some("Ljava/lang/String;")
+        );
+        // Arrays are stored as full descriptors and pass through verbatim.
+        assert_eq!(obj("[I").jni_field_descriptor().as_deref(), Some("[I"));
+        assert_eq!(
+            obj("[Ljava/lang/String;").jni_field_descriptor().as_deref(),
+            Some("[Ljava/lang/String;")
+        );
+        // A handle is a bare `long`.
+        let owned = IrType::Pointer(Pointer {
+            kind: PointerKind::Owned,
+            rust_type: "Box<String>".to_owned(),
+            nullable: false,
+        });
+        assert_eq!(owned.jni_field_descriptor().as_deref(), Some("J"));
+        // Unencodable types.
+        assert_eq!(IrType::Void.jni_field_descriptor(), None);
+        assert_eq!(IrType::Unsupported("Foo".to_owned()).jni_field_descriptor(), None);
+    }
+
+    #[test]
+    fn args_descriptor_concatenates_and_short_circuits() {
+        use Primitive::*;
+        assert_eq!(
+            args_descriptor(&[IrType::Primitive(Int), IrType::Primitive(Int)]).as_deref(),
+            Some("II")
+        );
+        assert_eq!(
+            args_descriptor(&[obj("java/lang/String"), obj("java/lang/String")]).as_deref(),
+            Some("Ljava/lang/String;Ljava/lang/String;")
+        );
+        assert_eq!(args_descriptor(&[]).as_deref(), Some(""));
+        // Any unencodable param poisons the whole descriptor.
+        assert_eq!(
+            args_descriptor(&[IrType::Primitive(Int), IrType::Unsupported("x".to_owned())]),
+            None
+        );
+    }
 }

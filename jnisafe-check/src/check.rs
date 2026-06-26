@@ -4,7 +4,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, Report};
-use crate::ir::{IrType, PointerKind, Receiver, RustExportProblem, Signature};
+use crate::ir::{
+    IrType, JavaClassModel, JavaFieldSig, JavaMethodSig, JavaRef, JavaRefKind, PointerKind,
+    Receiver, RustExportProblem, Signature, args_descriptor,
+};
 
 /// Compare the Java and Rust sides and accumulate diagnostics.
 pub fn check(java: &[Signature], rust: &[Signature]) -> Report {
@@ -146,6 +149,184 @@ pub fn check(java: &[Signature], rust: &[Signature]) -> Report {
     }
 
     report
+}
+
+/// Verify the Rust→Java call bindings declared by `bind_java_type!`'s
+/// `methods`/`fields`/`constructors` clauses: each names a Java member the Rust
+/// side intends to *call*, so we confirm it exists in the loaded class with a
+/// matching receiver and JVM descriptor. (Java→Rust natives are handled by
+/// [`check`]; this is the reverse direction.)
+pub fn check_java_refs(refs: &[JavaRef], models: &[JavaClassModel], report: &mut Report) {
+    let index: HashMap<&str, &JavaClassModel> = models
+        .iter()
+        .map(|m| (m.internal_name.as_str(), m))
+        .collect();
+
+    for r in refs {
+        let Some(model) = index.get(r.class_internal.as_str()).copied() else {
+            report.push(
+                Diagnostic::warning(
+                    "W004",
+                    format!(
+                        "cannot verify {} `{}`: Java class `{}` was not provided to --java",
+                        r.kind.noun(),
+                        r.java_name,
+                        r.class_internal.replace('/', ".")
+                    ),
+                )
+                .with_rust(Some(r.origin.clone()))
+                .help("pass that class (or its containing dir/jar) on --java to check this binding"),
+            );
+            continue;
+        };
+        match r.kind {
+            JavaRefKind::Method => check_method_ref(r, model, report),
+            JavaRefKind::Constructor => check_ctor_ref(r, model, report),
+            JavaRefKind::Field => check_field_ref(r, model, report),
+        }
+    }
+}
+
+/// The expected return descriptor for a `JavaRef` method (`"V"` for void).
+fn expected_ret(ret: &IrType) -> Option<String> {
+    match ret {
+        IrType::Void => Some("V".to_owned()),
+        other => other.jni_field_descriptor(),
+    }
+}
+
+fn check_method_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
+    let class = r.class_internal.replace('/', ".");
+    let by_name: Vec<&JavaMethodSig> = model.methods.iter().filter(|m| m.name == r.java_name).collect();
+    if by_name.is_empty() {
+        report.push(
+            Diagnostic::error(
+                "E040",
+                format!("no Java method `{}` on `{class}`", r.java_name),
+            )
+            .with_rust(Some(r.origin.clone()))
+            .help("check the method name (Rust `snake_case` maps to Java `lowerCamelCase`) or `name = \"…\"`"),
+        );
+        return;
+    }
+    let by_receiver: Vec<&&JavaMethodSig> =
+        by_name.iter().filter(|m| m.is_static == r.is_static).collect();
+    if by_receiver.is_empty() {
+        report.push(
+            Diagnostic::error(
+                "E040",
+                format!("no {} Java method `{}` on `{class}`", receiver_word(r.is_static), r.java_name),
+            )
+            .with_rust(Some(r.origin.clone()))
+            .note(format!(
+                "found a {} method of the same name — fix the `static` qualifier",
+                receiver_word(!r.is_static)
+            )),
+        );
+        return;
+    }
+
+    // Compare signatures only if the Rust types are encodable (unsupported types
+    // are flagged elsewhere); the name+receiver match already holds.
+    let (Some(eargs), Some(eret)) = (args_descriptor(&r.params), expected_ret(&r.ret)) else {
+        return;
+    };
+    if by_receiver
+        .iter()
+        .any(|m| m.arg_descriptor == eargs && m.ret_descriptor == eret)
+    {
+        return;
+    }
+    let found = by_receiver
+        .iter()
+        .map(|m| format!("({}){}", m.arg_descriptor, m.ret_descriptor))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    report.push(
+        Diagnostic::error(
+            "E041",
+            format!("Java method `{}` on `{class}` has no matching signature", r.java_name),
+        )
+        .with_rust(Some(r.origin.clone()))
+        .expected_found(format!("({eargs}){eret}"), found),
+    );
+}
+
+fn check_ctor_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
+    let class = r.class_internal.replace('/', ".");
+    let Some(eargs) = args_descriptor(&r.params) else {
+        return;
+    };
+    if model.constructors.contains(&eargs) {
+        return;
+    }
+    let found = if model.constructors.is_empty() {
+        "no constructors".to_owned()
+    } else {
+        model
+            .constructors
+            .iter()
+            .map(|c| format!("({c})V"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    report.push(
+        Diagnostic::error(
+            "E044",
+            format!("no constructor `({eargs})V` on `{class}`"),
+        )
+        .with_rust(Some(r.origin.clone()))
+        .expected_found(format!("({eargs})V"), found),
+    );
+}
+
+fn check_field_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
+    let class = r.class_internal.replace('/', ".");
+    let by_name: Vec<&JavaFieldSig> = model.fields.iter().filter(|f| f.name == r.java_name).collect();
+    if by_name.is_empty() {
+        report.push(
+            Diagnostic::error("E042", format!("no Java field `{}` on `{class}`", r.java_name))
+                .with_rust(Some(r.origin.clone()))
+                .help("check the field name (Rust `snake_case` maps to Java `lowerCamelCase`) or `name = \"…\"`"),
+        );
+        return;
+    }
+    let by_receiver: Vec<&&JavaFieldSig> =
+        by_name.iter().filter(|f| f.is_static == r.is_static).collect();
+    if by_receiver.is_empty() {
+        report.push(
+            Diagnostic::error(
+                "E042",
+                format!("no {} Java field `{}` on `{class}`", receiver_word(r.is_static), r.java_name),
+            )
+            .with_rust(Some(r.origin.clone()))
+            .note(format!(
+                "found a {} field of the same name — fix the `static` qualifier",
+                receiver_word(!r.is_static)
+            )),
+        );
+        return;
+    }
+    let Some(expected) = r.field_ty.as_ref().and_then(|t| t.jni_field_descriptor()) else {
+        return;
+    };
+    if by_receiver.iter().any(|f| f.descriptor == expected) {
+        return;
+    }
+    let found = by_receiver
+        .iter()
+        .map(|f| f.descriptor.clone())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    report.push(
+        Diagnostic::error("E043", format!("Java field `{}` on `{class}` has the wrong type", r.java_name))
+            .with_rust(Some(r.origin.clone()))
+            .expected_found(expected, found),
+    );
+}
+
+fn receiver_word(is_static: bool) -> &'static str {
+    if is_static { "static" } else { "instance" }
 }
 
 /// Diagnostic for a structurally-broken Rust `Java_*` fn (W002 / E004).
@@ -334,8 +515,13 @@ fn nullability_desc(nullable: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::check;
-    use crate::ir::{IrType, JavaLoc, MethodKey, Origin, Receiver, Signature};
+    use super::{check, check_java_refs};
+    use crate::diagnostics::Report;
+    use crate::ir::{
+        IrType, JavaClassModel, JavaFieldSig, JavaLoc, JavaMethodSig, JavaRef, JavaRefKind,
+        MethodKey, Origin, Primitive, Receiver, Signature, SrcLoc,
+    };
+    use std::path::PathBuf;
 
     fn java_sig(symbol: &str, method: &str) -> Signature {
         Signature {
@@ -374,6 +560,105 @@ mod tests {
             "expected E005:\n{}",
             report.render_human()
         );
+    }
+
+    // --- Rust→Java reference checks ----------------------------------------
+
+    fn int() -> IrType {
+        IrType::Primitive(Primitive::Int)
+    }
+
+    fn model() -> JavaClassModel {
+        JavaClassModel {
+            internal_name: "example/Foo".to_owned(),
+            methods: vec![JavaMethodSig {
+                name: "doubled".to_owned(),
+                is_static: true,
+                arg_descriptor: "I".to_owned(),
+                ret_descriptor: "I".to_owned(),
+            }],
+            fields: vec![JavaFieldSig {
+                name: "counter".to_owned(),
+                is_static: true,
+                descriptor: "I".to_owned(),
+            }],
+            constructors: vec!["I".to_owned()],
+        }
+    }
+
+    fn ref_(kind: JavaRefKind, name: &str, is_static: bool, params: Vec<IrType>, ret: IrType, field_ty: Option<IrType>) -> JavaRef {
+        JavaRef {
+            class_internal: "example/Foo".to_owned(),
+            kind,
+            java_name: name.to_owned(),
+            is_static,
+            params,
+            ret,
+            field_ty,
+            origin: SrcLoc {
+                file: PathBuf::from("lib.rs"),
+                symbol: format!("example.Foo.{name}"),
+                line: Some(1),
+            },
+        }
+    }
+
+    fn run_refs(refs: &[JavaRef]) -> Report {
+        let mut report = Report::default();
+        check_java_refs(refs, &[model()], &mut report);
+        report
+    }
+
+    #[test]
+    fn matching_refs_clean() {
+        let refs = vec![
+            ref_(JavaRefKind::Method, "doubled", true, vec![int()], int(), None),
+            ref_(JavaRefKind::Field, "counter", true, vec![], IrType::Void, Some(int())),
+            ref_(JavaRefKind::Constructor, "<init>", false, vec![int()], IrType::Void, None),
+        ];
+        let report = run_refs(&refs);
+        assert!(!report.has_errors(), "expected clean:\n{}", report.render_human());
+        assert_eq!(report.diagnostics.len(), 0);
+    }
+
+    #[test]
+    fn missing_method_is_e040_and_bad_signature_is_e041() {
+        let refs = vec![
+            ref_(JavaRefKind::Method, "tripled", true, vec![int()], int(), None),
+            ref_(JavaRefKind::Method, "doubled", true, vec![int(), int()], int(), None),
+        ];
+        let report = run_refs(&refs);
+        assert!(report.has_code("E040"), "{}", report.render_human());
+        assert!(report.has_code("E041"), "{}", report.render_human());
+    }
+
+    #[test]
+    fn field_and_constructor_problems() {
+        let refs = vec![
+            ref_(JavaRefKind::Field, "missing", true, vec![], IrType::Void, Some(int())),
+            ref_(
+                JavaRefKind::Field,
+                "counter",
+                true,
+                vec![],
+                IrType::Void,
+                Some(IrType::JavaObject { class: "java/lang/String".to_owned() }),
+            ),
+            ref_(JavaRefKind::Constructor, "<init>", false, vec![int(), int()], IrType::Void, None),
+        ];
+        let report = run_refs(&refs);
+        assert!(report.has_code("E042"), "{}", report.render_human()); // missing field
+        assert!(report.has_code("E043"), "{}", report.render_human()); // wrong field type
+        assert!(report.has_code("E044"), "{}", report.render_human()); // no such constructor
+    }
+
+    #[test]
+    fn unloaded_class_is_w004() {
+        let mut r = ref_(JavaRefKind::Method, "doubled", true, vec![int()], int(), None);
+        r.class_internal = "example/NotLoaded".to_owned();
+        let report = run_refs(&[r]);
+        assert!(report.has_code("W004"), "{}", report.render_human());
+        assert!(!report.has_errors());
     }
 
     #[test]

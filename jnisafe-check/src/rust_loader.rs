@@ -9,9 +9,21 @@ use quote::ToTokens;
 use syn::{FnArg, GenericArgument, Item, PathArguments, ReturnType, Type};
 
 use crate::ir::{
-    IrType, MethodKey, Origin, Pointer, PointerKind, Receiver, RustExportProblem, Signature, SrcLoc,
+    IrType, JavaRef, MethodKey, Origin, Pointer, PointerKind, Receiver, RustExportProblem,
+    Signature, SrcLoc,
 };
 use crate::typemap;
+
+mod macros;
+
+/// What the Rust front-end extracts from a crate: native-method signatures
+/// (Java→Rust, matched by symbol) plus the Rust→Java call bindings declared by
+/// `bind_java_type!`'s `methods`/`fields`/`constructors` clauses.
+#[derive(Debug, Default)]
+pub struct RustArtifacts {
+    pub natives: Vec<Signature>,
+    pub java_refs: Vec<JavaRef>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RustLoadError {
@@ -21,17 +33,17 @@ pub enum RustLoadError {
     Parse(PathBuf, syn::Error),
 }
 
-/// Abstraction over "give me the exported JNI functions of a crate."
+/// Abstraction over "give me the JNI artifacts of a crate."
 pub trait RustExtractor {
-    fn extract(&self, crate_dir: &Path) -> Result<Vec<Signature>, RustLoadError>;
+    fn extract(&self, crate_dir: &Path) -> Result<RustArtifacts, RustLoadError>;
 }
 
 /// Default `syn`-based source extractor.
 pub struct SynBackend;
 
 impl RustExtractor for SynBackend {
-    fn extract(&self, crate_dir: &Path) -> Result<Vec<Signature>, RustLoadError> {
-        let mut sigs = Vec::new();
+    fn extract(&self, crate_dir: &Path) -> Result<RustArtifacts, RustLoadError> {
+        let mut arts = RustArtifacts::default();
         // `src/**/*.rs` if a crate root; otherwise treat the path itself / its
         // tree as the source set (lets tests point at a single fixture file).
         let root = {
@@ -43,19 +55,65 @@ impl RustExtractor for SynBackend {
             }
         };
         if root.is_file() {
-            extract_file(&root, &mut sigs)?;
+            extract_file(&root, &mut arts)?;
         } else {
             for entry in walkdir::WalkDir::new(&root).into_iter().flatten() {
                 if entry.path().extension().is_some_and(|e| e == "rs") {
-                    extract_file(entry.path(), &mut sigs)?;
+                    extract_file(entry.path(), &mut arts)?;
                 }
             }
         }
-        Ok(sigs)
+        resolve_overloads(&mut arts.natives);
+        Ok(arts)
     }
 }
 
-fn extract_file(path: &Path, out: &mut Vec<Signature>) -> Result<(), RustLoadError> {
+/// Re-mangle overloaded exports to the long `..._method__<args>` form, matching
+/// how `java_loader` mangles a class that declares two natives of the same name.
+/// Scoped to signatures whose symbol *we* computed (a non-empty `java_class`,
+/// set by the `#[jni_mangle]` and macro paths); a legacy `Java_*` export carries
+/// the user's verbatim symbol (empty `java_class`) and is left untouched.
+fn resolve_overloads(sigs: &mut [Signature]) {
+    use std::collections::HashMap;
+
+    let mut groups: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    for (i, s) in sigs.iter().enumerate() {
+        if s.key.java_class.is_empty() {
+            continue;
+        }
+        groups
+            .entry((s.key.java_class.as_str(), s.key.java_method.as_str()))
+            .or_default()
+            .push(i);
+    }
+    // Collect the indices needing the long form first; `groups` borrows `sigs`,
+    // so it must be dropped before we mutate.
+    let overloaded: Vec<usize> = groups
+        .into_values()
+        .filter(|idxs| idxs.len() > 1)
+        .flatten()
+        .collect();
+
+    for i in overloaded {
+        // An unencodable param (e.g. an unsupported type) leaves the short form;
+        // the type itself is already flagged by the matcher.
+        let Some(desc) = crate::ir::args_descriptor(&sigs[i].params) else {
+            continue;
+        };
+        let symbol = crate::mangle::mangle(
+            &sigs[i].key.java_class,
+            &sigs[i].key.java_method,
+            true,
+            &desc,
+        );
+        sigs[i].key.symbol = symbol.clone();
+        if let Some(rust) = sigs[i].origin.rust.as_mut() {
+            rust.symbol = symbol;
+        }
+    }
+}
+
+fn extract_file(path: &Path, arts: &mut RustArtifacts) -> Result<(), RustLoadError> {
     let content =
         std::fs::read_to_string(path).map_err(|e| RustLoadError::Io(path.to_path_buf(), e))?;
     let file =
@@ -63,15 +121,24 @@ fn extract_file(path: &Path, out: &mut Vec<Signature>) -> Result<(), RustLoadErr
     for item in &file.items {
         let Item::Fn(f) = item else { continue };
         if let Some(sig) = lower_fn(f, path) {
-            out.push(sig);
+            arts.natives.push(sig);
         }
     }
+    // Also recognize the jni 0.22.4 macros: native methods (`native_method! { }`,
+    // `bind_java_type! { native_methods { } }`) and the Rust→Java call bindings
+    // (`bind_java_type!`'s `methods`/`fields`/`constructors`).
+    macros::collect(&file, path, &mut arts.natives, &mut arts.java_refs);
     Ok(())
 }
 
 fn lower_fn(f: &syn::ItemFn, path: &Path) -> Option<Signature> {
     let ident = f.sig.ident.to_string();
-    if !ident.starts_with("Java_") {
+
+    // Two recognized fn shapes: a `#[jni_mangle("pkg.Class")]`-attributed fn
+    // (any name — the macro derives the export symbol) or the legacy
+    // `Java_*`-named export. Anything else is not a native method.
+    let mangle = parse_jni_mangle(&f.attrs);
+    if mangle.is_none() && !ident.starts_with("Java_") {
         return None;
     }
 
@@ -87,18 +154,6 @@ fn lower_fn(f: &syn::ItemFn, path: &Path) -> Option<Signature> {
         })
         .collect();
 
-    // A `Java_*`-named fn is meant to be an export; lower it even when it isn't
-    // a valid one so the checker can flag the mistake (W002 / E004) instead of
-    // silently dropping it.
-    let export_problem = if !is_no_mangle(&f.attrs) || !is_system_abi(&f.sig.abi) {
-        Some(RustExportProblem::NotExported)
-    } else if inputs.len() < 2 {
-        // No room for the JNIEnv + receiver that every JNI entry point needs.
-        Some(RustExportProblem::TooFewParams)
-    } else {
-        None
-    };
-
     let receiver = inputs
         .get(1)
         .map(|t| receiver_kind(t))
@@ -109,12 +164,55 @@ fn lower_fn(f: &syn::ItemFn, path: &Path) -> Option<Signature> {
         ReturnType::Type(_, ty) => lower_type(ty),
     };
 
+    let (key, export_problem) = match &mangle {
+        Some(m) => {
+            // `#[jni_mangle]` derives the export symbol and ABI itself, so the
+            // only structural problem worth flagging is too few params for the
+            // env + receiver every JNI entry point needs.
+            let class_internal = crate::mangle::class_dotted_to_internal(&m.namespace);
+            let method = m
+                .method_name
+                .clone()
+                .unwrap_or_else(|| crate::mangle::snake_to_lower_camel(&ident));
+            let symbol = match &m.arg_descriptor {
+                Some(desc) => crate::mangle::mangle(&class_internal, &method, true, desc),
+                None => crate::mangle::mangle(&class_internal, &method, false, ""),
+            };
+            let problem = (inputs.len() < 2).then_some(RustExportProblem::TooFewParams);
+            (
+                MethodKey {
+                    symbol,
+                    java_class: class_internal,
+                    java_method: method,
+                },
+                problem,
+            )
+        }
+        None => {
+            // A `Java_*`-named fn is meant to be an export; lower it even when it
+            // isn't a valid one so the checker can flag the mistake (W002 / E004)
+            // instead of silently dropping it.
+            let problem = if !is_no_mangle(&f.attrs) || !is_system_abi(&f.sig.abi) {
+                Some(RustExportProblem::NotExported)
+            } else if inputs.len() < 2 {
+                Some(RustExportProblem::TooFewParams)
+            } else {
+                None
+            };
+            (
+                MethodKey {
+                    symbol: ident.clone(),
+                    java_class: String::new(),
+                    java_method: String::new(),
+                },
+                problem,
+            )
+        }
+    };
+
+    let symbol = key.symbol.clone();
     Some(Signature {
-        key: MethodKey {
-            symbol: ident.clone(),
-            java_class: String::new(),
-            java_method: String::new(),
-        },
+        key,
         is_static: false,
         receiver,
         params,
@@ -122,13 +220,62 @@ fn lower_fn(f: &syn::ItemFn, path: &Path) -> Option<Signature> {
         origin: Origin {
             rust: Some(SrcLoc {
                 file: path.to_path_buf(),
-                symbol: ident,
+                symbol,
                 line: Some(f.sig.ident.span().start().line).filter(|&l| l > 0),
             }),
             java: None,
         },
         export_problem,
     })
+}
+
+/// Parsed contents of a `#[jni_mangle("pkg.Class"[, "name"][, "sig"])]` attribute.
+struct JniMangle {
+    /// Fully-qualified Java class, dotted (e.g. `example.Correct`).
+    namespace: String,
+    /// Explicit Java method name, if given (else derived from the fn name).
+    method_name: Option<String>,
+    /// Argument portion of an explicit JNI signature (e.g. `Ljava/lang/String;`),
+    /// present only when the user disambiguates an overload. Drives the long
+    /// `..._method__<args>` symbol form.
+    arg_descriptor: Option<String>,
+}
+
+/// Find and parse a `#[jni_mangle(...)]` attribute, if present.
+fn parse_jni_mangle(attrs: &[syn::Attribute]) -> Option<JniMangle> {
+    let attr = attrs.iter().find(|a| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "jni_mangle")
+    })?;
+    let args = attr
+        .parse_args_with(
+            syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated,
+        )
+        .ok()?;
+    let mut it = args.iter().map(|l| l.value());
+    let namespace = it.next()?;
+    // Per the jni docs: with two args, the 2nd is a signature iff it contains
+    // '(', otherwise a method name; with three, they are name then signature.
+    let (method_name, sig) = match (it.next(), it.next()) {
+        (None, _) => (None, None),
+        (Some(s), None) if s.contains('(') => (None, Some(s)),
+        (Some(s), None) => (Some(s), None),
+        (Some(name), Some(sig)) => (Some(name), Some(sig)),
+    };
+    Some(JniMangle {
+        namespace,
+        method_name,
+        arg_descriptor: sig.and_then(|s| jni_sig_args(&s)),
+    })
+}
+
+/// Extract the parameter list of a JNI method signature: `"(args)ret"` → `"args"`.
+fn jni_sig_args(sig: &str) -> Option<String> {
+    let start = sig.find('(')?;
+    let end = sig.find(')')?;
+    (start < end).then(|| sig[start + 1..end].to_string())
 }
 
 fn is_no_mangle(attrs: &[syn::Attribute]) -> bool {
@@ -264,5 +411,123 @@ mod tests {
             "#[unsafe(export_name = \"x\")] fn f() {}"
         )));
         assert!(!is_no_mangle(&attrs_of("fn f() {}")));
+    }
+
+    fn lower_src(src: &str) -> Signature {
+        let f: syn::ItemFn = syn::parse_str(src).unwrap();
+        lower_fn(&f, std::path::Path::new("lib.rs")).expect("fn lowered")
+    }
+
+    #[test]
+    fn jni_mangle_fn_lowers_to_mangled_symbol() {
+        let sig = lower_src(
+            r#"#[jni_mangle("example.MangleExample")]
+               pub fn create<'local>(
+                   mut env: EnvUnowned<'local>,
+                   _class: JClass<'local>,
+                   value: JString<'local>,
+               ) -> JOwned<Box<String>> { unimplemented!() }"#,
+        );
+        assert_eq!(sig.key.symbol, "Java_example_MangleExample_create");
+        assert_eq!(sig.key.java_class, "example/MangleExample");
+        assert_eq!(sig.key.java_method, "create");
+        assert_eq!(sig.receiver, Receiver::Class);
+        assert_eq!(
+            sig.params,
+            vec![IrType::JavaObject {
+                class: "java/lang/String".into()
+            }]
+        );
+        assert!(sig.export_problem.is_none());
+        match &sig.ret {
+            IrType::Pointer(p) => {
+                assert_eq!(p.kind, PointerKind::Owned);
+                assert_eq!(p.rust_type, "Box<String>");
+            }
+            other => panic!("expected owned pointer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jni_mangle_derives_camel_case_method_name_and_skips_env_receiver() {
+        let sig = lower_src(
+            r#"#[jni_mangle("example.MangleExample")]
+               pub fn set_value<'local>(
+                   mut env: EnvUnowned<'local>,
+                   _class: JClass<'local>,
+                   ptr: JMut<'local, Box<String>>,
+                   value: JString<'local>,
+               ) { unimplemented!() }"#,
+        );
+        assert_eq!(sig.key.java_method, "setValue");
+        assert_eq!(sig.key.symbol, "Java_example_MangleExample_setValue");
+        assert_eq!(sig.params.len(), 2, "env + receiver skipped");
+    }
+
+    #[test]
+    fn resolve_overloads_remangles_same_name_to_long_form() {
+        // Two natives with the same Java (class, method) but different params:
+        // each must get its long-form symbol, exactly as `java_loader` mangles a
+        // class with two same-named natives.
+        let mut sigs = vec![
+            lower_src(
+                r#"#[jni_mangle("example.Over", "combine")]
+                   pub fn combine_ii<'l>(e: EnvUnowned<'l>, c: JClass<'l>, a: jint, b: jint) -> jint { unimplemented!() }"#,
+            ),
+            lower_src(
+                r#"#[jni_mangle("example.Over", "combine")]
+                   pub fn combine_ss<'l>(e: EnvUnowned<'l>, c: JClass<'l>, a: JString<'l>, b: JString<'l>) -> jint { unimplemented!() }"#,
+            ),
+        ];
+        // Before resolution both mangle to the same short symbol (a collision).
+        assert_eq!(sigs[0].key.symbol, sigs[1].key.symbol);
+
+        resolve_overloads(&mut sigs);
+
+        assert_eq!(sigs[0].key.symbol, "Java_example_Over_combine__II");
+        assert_eq!(
+            sigs[1].key.symbol,
+            "Java_example_Over_combine__Ljava_lang_String_2Ljava_lang_String_2"
+        );
+        // The Rust origin's symbol is kept in sync for diagnostics.
+        assert_eq!(
+            sigs[0].origin.rust.as_ref().unwrap().symbol,
+            sigs[0].key.symbol
+        );
+    }
+
+    #[test]
+    fn resolve_overloads_leaves_unique_names_short() {
+        let mut sigs = vec![
+            lower_src(
+                r#"#[jni_mangle("example.Over")]
+                   pub fn create<'l>(e: EnvUnowned<'l>, c: JClass<'l>, a: jint) -> jint { unimplemented!() }"#,
+            ),
+            lower_src(
+                r#"#[jni_mangle("example.Over")]
+                   pub fn destroy<'l>(e: EnvUnowned<'l>, c: JClass<'l>) { unimplemented!() }"#,
+            ),
+        ];
+        resolve_overloads(&mut sigs);
+        assert_eq!(sigs[0].key.symbol, "Java_example_Over_create");
+        assert_eq!(sigs[1].key.symbol, "Java_example_Over_destroy");
+    }
+
+    #[test]
+    fn jni_mangle_explicit_name_and_overload_signature() {
+        // Explicit method name + JNI signature → long `__<args>` symbol form.
+        let sig = lower_src(
+            r#"#[jni_mangle("example.MangleExample", "lookup", "(Ljava/lang/String;)V")]
+               pub fn lookup_impl<'local>(
+                   mut env: EnvUnowned<'local>,
+                   _class: JClass<'local>,
+                   key: JString<'local>,
+               ) { unimplemented!() }"#,
+        );
+        assert_eq!(
+            sig.key.symbol,
+            "Java_example_MangleExample_lookup__Ljava_lang_String_2"
+        );
+        assert_eq!(sig.key.java_method, "lookup");
     }
 }

@@ -28,7 +28,8 @@ pub enum RunError {
 /// Load both sides and run the checker.
 pub fn run(cfg: &cli::Config) -> Result<Report, RunError> {
     let java_sigs = java_loader::load(&cfg.java)?;
-    let rust_sigs = rust_loader::SynBackend.extract(&cfg.rust_crate)?;
+    let java_models = java_loader::load_models(&cfg.java)?;
+    let rust = rust_loader::SynBackend.extract(&cfg.rust_crate)?;
 
     if cfg.verbose {
         eprintln!("== Java signatures ==");
@@ -36,10 +37,19 @@ pub fn run(cfg: &cli::Config) -> Result<Report, RunError> {
             eprintln!("  {s:?}");
         }
         eprintln!("== Rust signatures ==");
-        for s in &rust_sigs {
+        for s in &rust.natives {
             eprintln!("  {s:?}");
+        }
+        eprintln!("== Rust→Java references ==");
+        for r in &rust.java_refs {
+            eprintln!("  {r:?}");
         }
     }
 
-    Ok(check::check(&java_sigs, &rust_sigs))
+    // Java→Rust: pair native methods by mangled symbol and compare signatures.
+    let mut report = check::check(&java_sigs, &rust.natives);
+    // Rust→Java: verify the methods/fields/constructors `bind_java_type!` calls
+    // exist in the loaded classes.
+    check::check_java_refs(&rust.java_refs, &java_models, &mut report);
+    Ok(report)
 }

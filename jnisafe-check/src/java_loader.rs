@@ -9,9 +9,12 @@ use cafebabe::attributes::{
     AnnotationElementValue, AttributeData, TypeAnnotation, TypeAnnotationTarget,
 };
 use cafebabe::descriptors::{FieldDescriptor, FieldType, MethodDescriptor, ReturnDescriptor};
-use cafebabe::{MethodAccessFlags, parse_class};
+use cafebabe::{FieldAccessFlags, MethodAccessFlags, parse_class};
 
-use crate::ir::{IrType, JavaLoc, MethodKey, Origin, Pointer, PointerKind, Receiver, Signature};
+use crate::ir::{
+    IrType, JavaClassModel, JavaFieldSig, JavaLoc, JavaMethodSig, MethodKey, Origin, Pointer,
+    PointerKind, Receiver, Signature,
+};
 use crate::mangle;
 use crate::typemap;
 
@@ -32,52 +35,122 @@ pub enum JavaLoadError {
 /// of `.class` files, or `.jar` archives).
 pub fn load(paths: &[PathBuf]) -> Result<Vec<Signature>, JavaLoadError> {
     let mut sigs = Vec::new();
-    for path in paths {
-        if path.is_dir() {
-            for entry in walkdir::WalkDir::new(path).into_iter().flatten() {
-                if entry.path().extension().is_some_and(|e| e == "class") {
-                    let bytes = read_file(entry.path())?;
-                    load_class(&bytes, &entry.path().display().to_string(), &mut sigs)?;
-                }
-            }
-        } else if path.extension().is_some_and(|e| e == "jar") {
-            load_jar(path, &mut sigs)?;
-        } else {
-            let bytes = read_file(path)?;
-            load_class(&bytes, &path.display().to_string(), &mut sigs)?;
-        }
-    }
+    visit_classes(paths, |class| {
+        lower_natives(class, &mut sigs);
+        Ok(())
+    })?;
     Ok(sigs)
+}
+
+/// Build a [`JavaClassModel`] — the callable surface (all methods, fields, and
+/// `<init>` constructors) — for every class in the given paths. Used to verify
+/// the Rust→Java bindings declared by `bind_java_type!`'s
+/// `methods`/`fields`/`constructors` clauses.
+pub fn load_models(paths: &[PathBuf]) -> Result<Vec<JavaClassModel>, JavaLoadError> {
+    let mut models = Vec::new();
+    visit_classes(paths, |class| {
+        models.push(build_model(class));
+        Ok(())
+    })?;
+    Ok(models)
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, JavaLoadError> {
     std::fs::read(path).map_err(|e| JavaLoadError::Io(path.to_path_buf(), e))
 }
 
-fn load_jar(path: &Path, out: &mut Vec<Signature>) -> Result<(), JavaLoadError> {
-    let file = std::fs::File::open(path).map_err(|e| JavaLoadError::Io(path.to_path_buf(), e))?;
-    let mut zip =
-        zip::ZipArchive::new(file).map_err(|e| JavaLoadError::Jar(path.to_path_buf(), e))?;
-    for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .map_err(|e| JavaLoadError::Jar(path.to_path_buf(), e))?;
-        if !entry.name().ends_with(".class") {
-            continue;
+/// Walk `.class` / directory / `.jar` inputs, parse each class, and hand it to
+/// `f`. Shared by [`load`] and [`load_models`].
+fn visit_classes<F>(paths: &[PathBuf], mut f: F) -> Result<(), JavaLoadError>
+where
+    F: FnMut(&cafebabe::ClassFile) -> Result<(), JavaLoadError>,
+{
+    for path in paths {
+        if path.is_dir() {
+            for entry in walkdir::WalkDir::new(path).into_iter().flatten() {
+                if entry.path().extension().is_some_and(|e| e == "class") {
+                    let bytes = read_file(entry.path())?;
+                    let class = parse_one(&bytes, entry.path().display().to_string())?;
+                    f(&class)?;
+                }
+            }
+        } else if path.extension().is_some_and(|e| e == "jar") {
+            let file =
+                std::fs::File::open(path).map_err(|e| JavaLoadError::Io(path.to_path_buf(), e))?;
+            let mut zip =
+                zip::ZipArchive::new(file).map_err(|e| JavaLoadError::Jar(path.to_path_buf(), e))?;
+            for i in 0..zip.len() {
+                let mut entry = zip
+                    .by_index(i)
+                    .map_err(|e| JavaLoadError::Jar(path.to_path_buf(), e))?;
+                if !entry.name().ends_with(".class") {
+                    continue;
+                }
+                let source = format!("{}!{}", path.display(), entry.name());
+                let mut bytes = Vec::with_capacity(entry.size() as usize);
+                entry
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| JavaLoadError::Io(path.to_path_buf(), e))?;
+                let class = parse_one(&bytes, source)?;
+                f(&class)?;
+            }
+        } else {
+            let bytes = read_file(path)?;
+            let class = parse_one(&bytes, path.display().to_string())?;
+            f(&class)?;
         }
-        let name = format!("{}!{}", path.display(), entry.name());
-        let mut bytes = Vec::with_capacity(entry.size() as usize);
-        entry
-            .read_to_end(&mut bytes)
-            .map_err(|e| JavaLoadError::Io(path.to_path_buf(), e))?;
-        load_class(&bytes, &name, out)?;
     }
     Ok(())
 }
 
-fn load_class(bytes: &[u8], source: &str, out: &mut Vec<Signature>) -> Result<(), JavaLoadError> {
-    let class =
-        parse_class(bytes).map_err(|e| JavaLoadError::Parse(source.to_owned(), e.to_string()))?;
+/// Parse one class, attributing a parse error to `source`.
+fn parse_one(bytes: &[u8], source: String) -> Result<cafebabe::ClassFile<'_>, JavaLoadError> {
+    parse_class(bytes).map_err(|e| JavaLoadError::Parse(source, e.to_string()))
+}
+
+/// Build the callable surface of one class for the Rust→Java check.
+fn build_model(class: &cafebabe::ClassFile) -> JavaClassModel {
+    let mut methods = Vec::new();
+    let mut constructors = Vec::new();
+    for m in &class.methods {
+        let name = m.name.as_ref();
+        // Static initializers are never callable from Rust.
+        if name == "<clinit>" {
+            continue;
+        }
+        let arg = arg_descriptor(&m.descriptor);
+        if name == "<init>" {
+            constructors.push(arg);
+        } else {
+            // Include native *and* non-native methods — JNI can call either, and
+            // it bypasses Java access control, so don't filter by visibility.
+            methods.push(JavaMethodSig {
+                name: name.to_owned(),
+                is_static: m.access_flags.contains(MethodAccessFlags::STATIC),
+                arg_descriptor: arg,
+                ret_descriptor: ret_descriptor(&m.descriptor),
+            });
+        }
+    }
+    let fields = class
+        .fields
+        .iter()
+        .map(|fd| JavaFieldSig {
+            name: fd.name.to_string(),
+            is_static: fd.access_flags.contains(FieldAccessFlags::STATIC),
+            descriptor: fd.descriptor.to_string(),
+        })
+        .collect();
+    JavaClassModel {
+        internal_name: class.this_class.to_string(),
+        methods,
+        fields,
+        constructors,
+    }
+}
+
+/// Lower the native methods of one parsed class into [`Signature`]s.
+fn lower_natives(class: &cafebabe::ClassFile, out: &mut Vec<Signature>) {
     let class_name = class.this_class.to_string();
 
     // First pass: count native methods by name so we know which need long-form
@@ -127,7 +200,6 @@ fn load_class(bytes: &[u8], source: &str, out: &mut Vec<Signature>) -> Result<()
             export_problem: None,
         });
     }
-    Ok(())
 }
 
 /// Returns true when the method carries `@io.github.mailmindlin.jnisafe.Ignore`.
@@ -318,11 +390,15 @@ fn arg_descriptor(desc: &MethodDescriptor) -> String {
     desc.parameters.iter().map(|fd| fd.to_string()).collect()
 }
 
-/// Full `(args)ret` descriptor, for diagnostics.
-fn full_descriptor(desc: &MethodDescriptor) -> String {
-    let ret = match &desc.return_type {
+/// The return-type descriptor, e.g. `"I"` or `"V"`.
+fn ret_descriptor(desc: &MethodDescriptor) -> String {
+    match &desc.return_type {
         ReturnDescriptor::Void => "V".to_owned(),
         ReturnDescriptor::Return(fd) => fd.to_string(),
-    };
-    format!("({}){}", arg_descriptor(desc), ret)
+    }
+}
+
+/// Full `(args)ret` descriptor, for diagnostics.
+fn full_descriptor(desc: &MethodDescriptor) -> String {
+    format!("({}){}", arg_descriptor(desc), ret_descriptor(desc))
 }

@@ -52,6 +52,69 @@ pub fn mangle(
     s
 }
 
+/// Convert a Rust `snake_case` identifier to the `lowerCamelCase` Java method
+/// name `#[jni_mangle]` / `native_method!` would derive from it.
+///
+/// Mirrors the jni 0.22.4 rules (see `docs/macros/jni_mangle.md`):
+/// * If the input contains any uppercase letter it is returned unchanged
+///   (already camelCase or intentionally cased).
+/// * Exactly one leading underscore is removed; any further leading underscores
+///   and all trailing underscores are preserved.
+/// * Each `_`-separated segment after the first has its first non-numeric
+///   character uppercased (so `array_2d_foo` → `array2DFoo`). Unicode-aware.
+pub fn snake_to_lower_camel(name: &str) -> String {
+    if name.chars().any(|c| c.is_uppercase()) {
+        return name.to_string();
+    }
+
+    let chars: Vec<char> = name.chars().collect();
+    let len = chars.len();
+    let lead = chars.iter().take_while(|c| **c == '_').count();
+    if lead == len {
+        // All underscores: drop one, keep the rest.
+        return "_".repeat(len.saturating_sub(1));
+    }
+    let trail = chars.iter().rev().take_while(|c| **c == '_').count();
+    let core: String = chars[lead..len - trail].iter().collect();
+
+    let mut camel = String::new();
+    for (i, seg) in core.split('_').enumerate() {
+        if i == 0 {
+            camel.push_str(seg);
+        } else {
+            camel.push_str(&capitalize_segment(seg));
+        }
+    }
+
+    let mut out = "_".repeat(lead.saturating_sub(1));
+    out.push_str(&camel);
+    out.push_str(&"_".repeat(trail));
+    out
+}
+
+/// Uppercase the first non-numeric character of `seg`, leaving leading digits
+/// and the remainder untouched (`"2d"` → `"2D"`, `"foo"` → `"Foo"`).
+fn capitalize_segment(seg: &str) -> String {
+    let mut out = String::new();
+    let mut capitalized = false;
+    for c in seg.chars() {
+        if !capitalized && !c.is_numeric() {
+            out.extend(c.to_uppercase());
+            capitalized = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Turn a dotted Java class name (`com.example.Foo`, `com.example.Outer::Inner`)
+/// into the internal binary name the mangler and `java_loader` use
+/// (`com/example/Foo`, `com/example/Outer$Inner`).
+pub fn class_dotted_to_internal(dotted: &str) -> String {
+    dotted.replace("::", "$").replace('.', "/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +152,49 @@ mod tests {
     fn unicode() {
         // U+00E9 'é' → _000e9
         assert_eq!(mangle_unit("é"), "_000e9");
+    }
+
+    #[test]
+    fn snake_to_camel_matches_jni_doc_table() {
+        // Cases lifted verbatim from jni-0.22.4 docs/macros/jni_mangle.md.
+        let cases = [
+            ("say_hello", "sayHello"),
+            ("get_user_name", "getUserName"),
+            ("_private_method", "privateMethod"),
+            ("__dunder__", "_dunder__"),
+            ("___priv", "__priv"),
+            ("trailing_", "trailing_"),
+            ("sayHello", "sayHello"),
+            ("getUserName", "getUserName"),
+            ("Foo_Bar", "Foo_Bar"),
+            ("XMLParser", "XMLParser"),
+            ("init", "init"),
+            ("test_αλφα", "testΑλφα"),
+            ("array_2d_foo", "array2DFoo"),
+            ("test_3d", "test3D"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                snake_to_lower_camel(input),
+                want,
+                "snake→camel of {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_dotted_to_internal_forms() {
+        assert_eq!(
+            class_dotted_to_internal("example.Correct"),
+            "example/Correct"
+        );
+        assert_eq!(
+            class_dotted_to_internal("com.example.Foo"),
+            "com/example/Foo"
+        );
+        assert_eq!(
+            class_dotted_to_internal("com.example.Outer::Inner"),
+            "com/example/Outer$Inner"
+        );
     }
 }
