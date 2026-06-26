@@ -15,10 +15,16 @@ private static native String tryGet(@Ref("Box<String>") long ptr);
 ```rust
 // Rust: jnisafe-check verifies these line up with the Java declarations above
 #[no_mangle]
-pub extern "system" fn Java_example_Correct_create(/* … */) -> JOwned<Box<String>> { /* … */ }
+pub extern "system" fn Java_example_HandWritten_create(/* … */) -> JOwned<Box<String>> { /* … */ }
 ```
 
 Can you get around it? Sure. But it's better than nothing.
+
+On top of the static check, the [`jnisafe`](jnisafe/) wrapper types add **debug-only
+runtime validation**: in debug builds they track every live handle and catch a
+wrong-type, freed, double-freed, or bogus `long` the moment Java passes it back
+(surfaced as a Java exception), plus a checked `borrow_mut()` for mutable
+aliasing. It compiles out entirely in release — see the [`jnisafe` README](jnisafe/README.md).
 
 ## Getting started
 
@@ -61,7 +67,54 @@ public class Counter {
 ### 3. Implement the natives in Rust with `jnisafe` wrappers
 
 Add `jnisafe` to your crate and use `JOwned` / `JRef` / `JMut` in place of raw `long`s.
-See [`example/rust`](example/rust/src/lib.rs) for a complete, compiling implementation.
+See [`example/rust`](example/rust/src/hand_written.rs) for a complete, compiling implementation.
+
+#### Using the jni 0.22.4 ergonomic macros
+
+`jnisafe-check` also understands natives declared with the jni crate's macros, so
+you keep the static check whichever style you adopt:
+
+* **`#[jni_mangle("pkg.Class")]`** — the function keeps its real signature, so
+  `JOwned` / `JRef` / `JMut` work transparently, exactly as in a hand-written
+  `Java_*` export. The Java method name is derived from the Rust fn name
+  (`set_value` → `setValue`). See [`mangle.rs`](example/rust/src/mangle.rs).
+* **`native_method! { … }`** and **`bind_java_type! { native_methods { … } }`** —
+  carry an *owned* handle through the macro with a `type_map` entry that maps it
+  to `long`:
+
+  ```rust
+  native_method! {
+      java_type = "example.Foo",
+      type_map = { unsafe JOwned<Box<String>> => long },
+      static fn create(value: JString) -> JOwned<Box<String>>,
+  }
+  ```
+
+  The `unsafe` mapping asserts the handle is layout-compatible with `jlong`
+  (it is — the jnisafe types are `#[repr(transparent)]` over a `jlong`), and the
+  macro emits the real `JOwned<…>` type into your impl. See
+  [`native_method.rs`](example/rust/src/native_method.rs) and
+  [`bind_type.rs`](example/rust/src/bind_type.rs).
+
+  > **Borrowed handles (`JRef` / `JMut`)** carry a `'local` lifetime that can't be
+  > named from these macros' `const`-evaluated context, so use `#[jni_mangle]`
+  > for borrow parameters; `native_method!` / `bind_java_type!` cover owned
+  > handles and plain JNI types.
+
+* **Overloaded natives** are handled too. When a class declares two natives of
+  the same name, both the JVM and the checker mangle each to the long
+  `Java_pkg_Class_name__<args>` form; the checker derives the Rust-side argument
+  descriptor from your signatures so the two overloads pair up cleanly. See
+  [`overloaded.rs`](example/rust/src/overloaded.rs).
+
+* **`bind_java_type! { methods { … } fields { … } constructors { … } }`** — the
+  *Rust→Java* direction: these clauses generate type-safe wrappers that call
+  into Java. The checker verifies each named method/field/constructor exists on
+  the bound class with a matching receiver (static/instance) and JVM descriptor —
+  a missing or mis-typed member is reported (E040–E044) instead of failing at
+  runtime. If the bound class isn't passed to `--java`, the binding can't be
+  verified and a warning (W004) is emitted. See
+  [`bind_type.rs`](example/rust/src/bind_type.rs).
 
 ### 4. Check that the two sides agree
 
