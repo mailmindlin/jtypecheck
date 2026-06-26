@@ -1,10 +1,12 @@
 //! End-to-end + loader tests driving the public library API against the
-//! committed fixtures (`tests/fixtures/classes/*.class`, `tests/fixtures/incorrect/wrong.rs`)
-//! and the workspace `example/rust` crate.
+//! fixtures (`tests/fixtures/classes/*.class`, `tests/fixtures/*/wrong.rs`) and
+//! the workspace `example/rust` crate.
 //!
-//! Regenerate the `.class` fixtures with:
-//!   javac -d /tmp/ann ../jnisafe-annotations/io/github/mailmindlin/jnisafe/*.java
-//!   javac -cp /tmp/ann -d tests/fixtures/classes ../example/java/example/*.java
+//! The `.class` files under `tests/fixtures/classes/` are generated, not
+//! committed (see `.gitignore`). `pixi run test` regenerates them before the
+//! suite runs; a bare `cargo test` needs them produced first, via:
+//!   pixi run fixtures
+//! If they are absent the tests fail with a message pointing here.
 
 use std::path::PathBuf;
 
@@ -19,6 +21,20 @@ fn root() -> PathBuf {
 
 fn fixture(rel: &str) -> PathBuf {
     root().join(rel)
+}
+
+/// Resolve a generated `.class` fixture, failing with an actionable hint if the
+/// classes have not been compiled yet (they are gitignored build artifacts).
+fn class(rel: &str) -> PathBuf {
+    let path = fixture(rel);
+    assert!(
+        path.exists(),
+        "missing generated fixture: {}\n\
+         The `.class` files under tests/fixtures/classes/ are not committed.\n\
+         Run `pixi run fixtures` (or `pixi run test`) to compile them, then re-run.",
+        path.display()
+    );
+    path
 }
 
 fn example_rust() -> PathBuf {
@@ -37,9 +53,19 @@ fn config(rust_crate: PathBuf, java: Vec<PathBuf>) -> Config {
 
 #[test]
 fn correct_passes() {
+    // example/rust implements `HandWritten` as hand-written `Java_*` exports and
+    // the remaining classes via the jni macros (`#[jni_mangle]`, `native_method!`,
+    // `bind_java_type!`, plus two overloaded `native_method!` natives for
+    // `Overloaded`); all must match cleanly.
     let cfg = config(
         example_rust(),
-        vec![fixture("tests/fixtures/classes/example/Correct.class")],
+        vec![
+            class("tests/fixtures/classes/example/HandWritten.class"),
+            class("tests/fixtures/classes/example/Mangle.class"),
+            class("tests/fixtures/classes/example/NativeMethod.class"),
+            class("tests/fixtures/classes/example/BindType.class"),
+            class("tests/fixtures/classes/example/Overloaded.class"),
+        ],
     );
     let report = run(&cfg).expect("run");
     assert!(
@@ -54,7 +80,7 @@ fn correct_passes() {
 fn incorrect_reports_one_diagnostic_per_case() {
     let cfg = config(
         fixture("tests/fixtures/incorrect"),
-        vec![fixture("tests/fixtures/classes/example/Incorrect.class")],
+        vec![class("tests/fixtures/classes/example/Incorrect.class")],
     );
     let report = run(&cfg).expect("run");
 
@@ -74,10 +100,73 @@ fn incorrect_reports_one_diagnostic_per_case() {
 }
 
 #[test]
+fn incorrect_macros_report_expected_diagnostics() {
+    // Macro-declared natives are validated like hand-written exports: one
+    // diagnostic per deliberately-wrong method across the three macro forms.
+    let cfg = config(
+        fixture("tests/fixtures/incorrect_macros"),
+        vec![class("tests/fixtures/classes/example/IncorrectMacros.class")],
+    );
+    let report = run(&cfg).expect("run");
+
+    for code in ["E023", "E024", "E021", "W003"] {
+        assert!(
+            report.has_code(code),
+            "missing {code}; report was:\n{}",
+            report.render_human()
+        );
+    }
+    assert!(report.has_errors());
+    assert_eq!(report.error_count(), 3);
+    assert_eq!(report.warning_count(), 1);
+}
+
+#[test]
+fn incorrect_calls_report_expected_diagnostics() {
+    // The Rust→Java direction: `bind_java_type!`'s methods/fields/constructors
+    // clauses are verified against the Java class. Each deliberately-wrong entry
+    // isolates one diagnostic, plus a binding to an unloaded class (W004).
+    let cfg = config(
+        fixture("tests/fixtures/incorrect_calls"),
+        vec![class("tests/fixtures/classes/example/IncorrectCalls.class")],
+    );
+    let report = run(&cfg).expect("run");
+
+    for code in ["E040", "E041", "E042", "E043", "E044", "W004"] {
+        assert!(
+            report.has_code(code),
+            "missing {code}; report was:\n{}",
+            report.render_human()
+        );
+    }
+    assert!(report.has_errors());
+    assert_eq!(report.error_count(), 5);
+    assert_eq!(report.warning_count(), 1);
+}
+
+#[test]
+fn overloaded_macro_methods_match_when_supported() {
+    // Two overloaded `native_method!` impls match their long-form overloaded
+    // Java declarations: the Rust front-end's `resolve_overloads` pass re-mangles
+    // same-named macro natives to the same `..._combine__<args>` symbols
+    // `java_loader` produces, so they pair up cleanly with no collision.
+    let cfg = config(
+        fixture("tests/fixtures/overloaded"),
+        vec![class("tests/fixtures/classes/example/Overloaded.class")],
+    );
+    let report = run(&cfg).expect("run");
+    assert!(
+        !report.has_errors(),
+        "overloaded macro natives should match their Java declarations:\n{}",
+        report.render_human()
+    );
+}
+
+#[test]
 fn json_output_carries_codes() {
     let cfg = config(
         fixture("tests/fixtures/incorrect"),
-        vec![fixture("tests/fixtures/classes/example/Incorrect.class")],
+        vec![class("tests/fixtures/classes/example/Incorrect.class")],
     );
     let report = run(&cfg).expect("run");
     let json = report.render_json();
@@ -95,7 +184,7 @@ fn json_output_carries_codes() {
 #[test]
 fn java_loader_reads_pointer_annotations() {
     let sigs =
-        java_loader::load(&[fixture("tests/fixtures/classes/example/Correct.class")]).unwrap();
+        java_loader::load(&[class("tests/fixtures/classes/example/HandWritten.class")]).unwrap();
 
     let find = |method: &str| {
         sigs.iter()
@@ -137,16 +226,16 @@ fn java_loader_reads_pointer_annotations() {
     );
 
     assert!(find("create").is_static);
-    assert_eq!(find("create").key.symbol, "Java_example_Correct_create");
+    assert_eq!(find("create").key.symbol, "Java_example_HandWritten_create");
 }
 
 #[test]
 fn rust_loader_skips_env_and_receiver() {
-    let sigs = SynBackend.extract(&example_rust()).unwrap();
+    let sigs = SynBackend.extract(&example_rust()).unwrap().natives;
     let find = |sym: &str| sigs.iter().find(|s| s.key.symbol == sym).expect(sym);
 
     // create(EnvUnowned, JClass, JString) -> JOwned<Box<String>>
-    let create = find("Java_example_Correct_create");
+    let create = find("Java_example_HandWritten_create");
     assert_eq!(create.receiver, Receiver::Class);
     assert_eq!(create.params.len(), 1, "env + class skipped");
     assert_eq!(
@@ -164,17 +253,17 @@ fn rust_loader_skips_env_and_receiver() {
     }
 
     // tryGet takes Option<JRef<..>> => nullable.
-    match &find("Java_example_Correct_tryGet").params[0] {
+    match &find("Java_example_HandWritten_tryGet").params[0] {
         IrType::Pointer(p) => assert!(p.nullable, "Option<JRef> => nullable"),
         other => panic!("expected pointer, got {other:?}"),
     }
     // get takes a bare JRef => non-nullable.
-    match &find("Java_example_Correct_get").params[0] {
+    match &find("Java_example_HandWritten_get").params[0] {
         IrType::Pointer(p) => assert!(!p.nullable, "bare JRef => non-nullable"),
         other => panic!("expected pointer, got {other:?}"),
     }
 
     // Param counts after skipping env+receiver: create=1, tryGet=1, get=1, set=2, drop=1.
-    assert_eq!(find("Java_example_Correct_set").params.len(), 2);
-    assert_eq!(find("Java_example_Correct_drop").params.len(), 1);
+    assert_eq!(find("Java_example_HandWritten_set").params.len(), 2);
+    assert_eq!(find("Java_example_HandWritten_drop").params.len(), 1);
 }
