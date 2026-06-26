@@ -1,0 +1,12 @@
+{
+  // The Java sources here are standalone demo files (no Gradle/Maven build),
+  // so tell the Java extension where the example sources live and where to find
+  // the jnisafe annotations they import.
+  //
+  // The referenced jar is produced by `pixi run jar` (output: build/jnisafe-annotations.jar).
+  // If you see unresolved-import errors, run `pixi run jar` once, then
+  // "Java: Clean Java Language Server Workspace" from the command palette.
+  "java.project.sourcePaths": ["example/java"],
+  "java.project.referencedLibraries": ["build/jnisafe-annotations.jar"],
+  "rust-analyzer.check.command": "clippy"
+}
