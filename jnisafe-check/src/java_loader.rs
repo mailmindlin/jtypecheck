@@ -8,9 +8,13 @@ use std::path::{Path, PathBuf};
 use cafebabe::attributes::{
     AnnotationElementValue, AttributeData, TypeAnnotation, TypeAnnotationTarget,
 };
+use cafebabe::bytecode::Opcode;
 use cafebabe::descriptors::{FieldDescriptor, FieldType, MethodDescriptor, ReturnDescriptor};
 use cafebabe::{FieldAccessFlags, MethodAccessFlags, parse_class};
 
+use crate::code::{
+    self, ExceptionRange, Insn, LocalHandleAnn, LocalName, MemberRef, MethodCode, Op, ParamInfo,
+};
 use crate::ir::{
     IrType, JavaClassModel, JavaFieldSig, JavaLoc, JavaMethodSig, MethodKey, Origin, Pointer,
     PointerKind, Receiver, Signature,
@@ -217,6 +221,49 @@ fn has_ignore(attrs: &[cafebabe::attributes::AttributeInfo]) -> bool {
         }
     }
     false
+}
+
+/// Read the `@SuppressJni` categories declared on an element (a class, method, or
+/// field), normalising the descriptive synonyms to their canonical key. Empty if
+/// the element carries no `@SuppressJni`.
+fn suppress_categories(attrs: &[cafebabe::attributes::AttributeInfo]) -> Vec<String> {
+    let mut cats = Vec::new();
+    for a in attrs {
+        let anns = match &a.data {
+            AttributeData::RuntimeInvisibleAnnotations(v)
+            | AttributeData::RuntimeVisibleAnnotations(v) => v,
+            _ => continue,
+        };
+        for ann in anns {
+            if annotation_class(&ann.type_descriptor) != format!("{ANN_PKG}/SuppressJni") {
+                continue;
+            }
+            for el in &ann.elements {
+                if el.name.as_ref() != "value" {
+                    continue;
+                }
+                if let AnnotationElementValue::ArrayValue(items) = &el.value {
+                    for item in items {
+                        if let AnnotationElementValue::StringConstant(s) = item {
+                            cats.push(normalize_category(s));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cats
+}
+
+/// Canonicalise a `@SuppressJni` category, mapping the descriptive synonyms
+/// (`"type"`, `"leak"`) onto the Rust-flavoured keys the checker gates on.
+fn normalize_category(raw: &str) -> String {
+    match raw {
+        "type" => "transmute",
+        "leak" => "forget",
+        other => other,
+    }
+    .to_owned()
 }
 
 /// A pointer annotation recovered from the bytecode type-annotation table.
@@ -434,4 +481,535 @@ fn ret_descriptor(desc: &MethodDescriptor) -> String {
 /// Full `(args)ret` descriptor, for diagnostics.
 fn full_descriptor(desc: &MethodDescriptor) -> String {
     format!("({}){}", arg_descriptor(desc), ret_descriptor(desc))
+}
+
+// === Flow-analysis input ===================================================
+//
+// Richer per-class data for the Java-side handle-flow analysis (`flow.rs`):
+// member-level handle contracts and access flags (for the declaration lints and
+// for resolving call-site contracts) plus the source file (for diagnostics).
+// Built from the same parsed classes as the boundary check; per-method bytecode
+// is added in a later phase.
+
+/// A class prepared for handle-flow analysis.
+#[derive(Debug, Clone)]
+pub struct FlowClass {
+    /// Internal binary name, e.g. `example/Flow`.
+    pub internal_name: String,
+    /// The `SourceFile` attribute (e.g. `Flow.java` / `Flow.kt`), if present.
+    pub source_file: Option<String>,
+    pub fields: Vec<FlowField>,
+    pub methods: Vec<FlowMethod>,
+    /// `@SuppressJni` categories declared on the class itself (silences those
+    /// categories everywhere in the class).
+    pub suppressed: Vec<String>,
+}
+
+/// A field, with its handle contract and access (for the exposure/field checks).
+#[derive(Debug, Clone)]
+pub struct FlowField {
+    pub name: String,
+    /// JVM field descriptor, e.g. `J`, `Ljava/lang/String;`.
+    pub descriptor: String,
+    pub is_public: bool,
+    pub is_protected: bool,
+    pub is_static: bool,
+    /// The `@Owned`/`@Ref`/`@Mut` contract, if this field declares one.
+    pub handle: Option<Pointer>,
+    /// `@SuppressJni` categories on the field declaration.
+    pub suppressed: Vec<String>,
+}
+
+/// A method, with its per-parameter / return handle contracts and access.
+#[derive(Debug, Clone)]
+pub struct FlowMethod {
+    pub name: String,
+    /// Full `(args)ret` descriptor, e.g. `(Ljava/lang/String;)J`.
+    pub descriptor: String,
+    pub is_public: bool,
+    pub is_protected: bool,
+    pub is_static: bool,
+    pub is_native: bool,
+    /// Per-parameter handle contract (`None` where the slot is not a handle).
+    pub params: Vec<Option<Pointer>>,
+    /// Return handle contract, if the method returns a handle.
+    pub ret: Option<Pointer>,
+    /// The analyzable method body, if it has decoded bytecode (absent for
+    /// `native`/`abstract` methods).
+    pub code: Option<MethodCode>,
+    /// `@SuppressJni` categories on the method declaration.
+    pub suppressed: Vec<String>,
+}
+
+/// Load every class in `paths` as a [`FlowClass`] for the flow analysis. Accepts
+/// the same `.class` / directory / `.jar` inputs as [`load`].
+pub fn load_flow(paths: &[PathBuf]) -> Result<Vec<FlowClass>, JavaLoadError> {
+    let mut out = Vec::new();
+    visit_classes(paths, |class| {
+        out.push(build_flow_class(class));
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn build_flow_class(class: &cafebabe::ClassFile) -> FlowClass {
+    let fields = class
+        .fields
+        .iter()
+        .map(|fd| FlowField {
+            name: fd.name.to_string(),
+            descriptor: fd.descriptor.to_string(),
+            is_public: fd.access_flags.contains(FieldAccessFlags::PUBLIC),
+            is_protected: fd.access_flags.contains(FieldAccessFlags::PROTECTED),
+            is_static: fd.access_flags.contains(FieldAccessFlags::STATIC),
+            handle: field_pointer_annotation(&fd.attributes),
+            suppressed: suppress_categories(&fd.attributes),
+        })
+        .collect();
+
+    let methods = class
+        .methods
+        .iter()
+        // Skip the static initializer and compiler-synthesized methods (lambda
+        // bodies, bridges): they are desugaring noise with no source-level
+        // handle contract to check.
+        .filter(|m| {
+            m.name.as_ref() != "<clinit>"
+                && !m.access_flags.contains(MethodAccessFlags::SYNTHETIC)
+                && !m.access_flags.contains(MethodAccessFlags::BRIDGE)
+        })
+        .map(|m| {
+            let anns = collect_pointer_annotations(&m.attributes);
+            // Reuse `pointer_ir`, which validates the slot is a bare `long`; a
+            // misannotation on any other slot is not a usable handle contract.
+            let to_handle = |fd: &FieldDescriptor, ann: &PtrAnn| match pointer_ir(fd, ann) {
+                IrType::Pointer(p) => Some(p),
+                _ => None,
+            };
+            let params: Vec<Option<Pointer>> = m
+                .descriptor
+                .parameters
+                .iter()
+                .enumerate()
+                .map(|(i, fd)| anns.params.get(&i).and_then(|ann| to_handle(fd, ann)))
+                .collect();
+            let ret = match &m.descriptor.return_type {
+                ReturnDescriptor::Return(fd) => {
+                    anns.ret.as_ref().and_then(|ann| to_handle(fd, ann))
+                }
+                ReturnDescriptor::Void => None,
+            };
+            let is_static = m.access_flags.contains(MethodAccessFlags::STATIC);
+            let code = m.attributes.iter().find_map(|a| match &a.data {
+                AttributeData::Code(cd) => lower_code(cd, m, is_static, &params),
+                _ => None,
+            });
+            FlowMethod {
+                name: m.name.to_string(),
+                descriptor: full_descriptor(&m.descriptor),
+                is_public: m.access_flags.contains(MethodAccessFlags::PUBLIC),
+                is_protected: m.access_flags.contains(MethodAccessFlags::PROTECTED),
+                is_static,
+                is_native: m.access_flags.contains(MethodAccessFlags::NATIVE),
+                params,
+                ret,
+                code,
+                suppressed: suppress_categories(&m.attributes),
+            }
+        })
+        .collect();
+
+    FlowClass {
+        internal_name: class.this_class.to_string(),
+        source_file: source_file(class),
+        fields,
+        methods,
+        suppressed: suppress_categories(&class.attributes),
+    }
+}
+
+fn source_file(class: &cafebabe::ClassFile) -> Option<String> {
+    class.attributes.iter().find_map(|a| match &a.data {
+        AttributeData::SourceFile(s) => Some(s.to_string()),
+        _ => None,
+    })
+}
+
+/// Lower a method's decoded `Code` into the owned [`MethodCode`] the flow
+/// analysis walks. `None` if the bytecode was not decoded (e.g. parsing was
+/// configured to skip it).
+fn lower_code(
+    cd: &cafebabe::attributes::CodeData,
+    m: &cafebabe::MethodInfo,
+    is_static: bool,
+    params: &[Option<Pointer>],
+) -> Option<MethodCode> {
+    let bytecode = cd.bytecode.as_ref()?;
+
+    // Line numbers: (start_pc -> line), looked up by greatest start_pc <= offset.
+    let mut lines: Vec<(u32, u32)> = Vec::new();
+    for a in &cd.attributes {
+        if let AttributeData::LineNumberTable(entries) = &a.data {
+            lines.extend(
+                entries
+                    .iter()
+                    .map(|e| (u32::from(e.start_pc), u32::from(e.line_number))),
+            );
+        }
+    }
+    lines.sort_unstable_by_key(|(pc, _)| *pc);
+    let line_at = |off: u32| -> Option<u32> {
+        lines
+            .iter()
+            .rev()
+            .find(|(pc, _)| *pc <= off)
+            .map(|(_, l)| *l)
+    };
+
+    let insns = bytecode
+        .opcodes
+        .iter()
+        .map(|(off, op)| {
+            let offset = *off as u32;
+            Insn {
+                offset,
+                line: line_at(offset),
+                op: classify_op(op, offset),
+            }
+        })
+        .collect();
+
+    let exceptions = cd
+        .exception_table
+        .iter()
+        .map(|e| ExceptionRange {
+            start: u32::from(e.start_pc),
+            end: u32::from(e.end_pc),
+            handler: u32::from(e.handler_pc),
+        })
+        .collect();
+
+    // Local variable names — present only when compiled with `-g`/`-g:vars`.
+    let mut local_names = Vec::new();
+    for a in &cd.attributes {
+        if let AttributeData::LocalVariableTable(entries) = &a.data {
+            local_names.extend(entries.iter().map(|e| LocalName {
+                slot: e.index,
+                start: u32::from(e.start_pc),
+                end: u32::from(e.start_pc) + u32::from(e.length),
+                name: e.name.to_string(),
+            }));
+        }
+    }
+
+    // Local `@Ref`/`@Mut`/`@Owned` annotations (localvar_target type annotations
+    // inside the `Code` attribute).
+    let mut local_handles = Vec::new();
+    for a in &cd.attributes {
+        let tas: &[TypeAnnotation] = match &a.data {
+            AttributeData::RuntimeInvisibleTypeAnnotations(v)
+            | AttributeData::RuntimeVisibleTypeAnnotations(v) => v,
+            _ => continue,
+        };
+        for ta in tas {
+            if !ta.target_path.is_empty() {
+                continue;
+            }
+            let TypeAnnotationTarget::LocalVar(entries) = &ta.target_type else {
+                continue;
+            };
+            let Some(kind) = pointer_kind(&annotation_class(&ta.annotation.type_descriptor)) else {
+                continue;
+            };
+            let (rust_type, nullable) = read_members(&ta.annotation);
+            local_handles.extend(entries.iter().map(|e| LocalHandleAnn {
+                slot: e.index,
+                start: u32::from(e.start_pc),
+                end: u32::from(e.start_pc) + u32::from(e.length),
+                ptr: Pointer {
+                    kind,
+                    rust_type: rust_type.clone(),
+                    nullable,
+                },
+            }));
+        }
+    }
+
+    // Parameter slot layout: `this` at slot 0 for instance methods, then each
+    // parameter in turn (a long/double occupies two local slots).
+    let mut param_infos = Vec::with_capacity(params.len());
+    let mut slot: u16 = u16::from(!is_static);
+    for (i, fd) in m.descriptor.parameters.iter().enumerate() {
+        let wide =
+            fd.dimensions == 0 && matches!(fd.field_type, FieldType::Long | FieldType::Double);
+        param_infos.push(ParamInfo {
+            slot,
+            wide,
+            handle: params.get(i).cloned().flatten(),
+        });
+        slot += if wide { 2 } else { 1 };
+    }
+
+    Some(MethodCode {
+        max_locals: cd.max_locals,
+        insns,
+        exceptions,
+        local_names,
+        local_handles,
+        params: param_infos,
+    })
+}
+
+/// Classify one decoded opcode into the owned [`Op`], resolving branch targets to
+/// absolute offsets. Opcodes irrelevant to handle-flow collapse into [`Op::Other`]
+/// carrying just their value-level stack effect, so the abstract stack stays
+/// balanced.
+fn classify_op(op: &Opcode, offset: u32) -> Op {
+    use Opcode as O;
+
+    let target = |j: i32| -> u32 { (i64::from(offset) + i64::from(j)) as u32 };
+    let member = |m: &cafebabe::constant_pool::MemberRef| MemberRef {
+        class: m.class_name.to_string(),
+        name: m.name_and_type.name.to_string(),
+        descriptor: m.name_and_type.descriptor.to_string(),
+    };
+    let field_wide = |m: &cafebabe::constant_pool::MemberRef| {
+        matches!(m.name_and_type.descriptor.as_ref(), "J" | "D")
+    };
+    let invoke = |m: &cafebabe::constant_pool::MemberRef, is_static: bool| {
+        let target = member(m);
+        let (arg_widths, ret) = code::parse_method_descriptor(&target.descriptor);
+        Op::Invoke {
+            target,
+            is_static,
+            arg_widths,
+            ret,
+        }
+    };
+
+    match op {
+        // --- long constants & arithmetic (provenance-relevant) ---
+        O::Lconst0 => Op::LongConst { zero: true },
+        O::Lconst1 => Op::LongConst { zero: false },
+        O::Ldc2W(cafebabe::constant_pool::Loadable::LiteralConstant(
+            cafebabe::constant_pool::LiteralConstant::Long(v),
+        )) => Op::LongConst { zero: *v == 0 },
+        // `ldc2_w` of a double is a wide non-handle value.
+        O::Ldc2W(_) => Op::Other {
+            pops: 0,
+            pushes: vec![true],
+        },
+        O::Ladd
+        | O::Lsub
+        | O::Lmul
+        | O::Ldiv
+        | O::Lrem
+        | O::Land
+        | O::Lor
+        | O::Lxor
+        | O::Lshl
+        | O::Lshr
+        | O::Lushr => Op::LongCompute { pops: 2 },
+        O::Lneg | O::I2l | O::F2l | O::D2l => Op::LongCompute { pops: 1 },
+        O::Lcmp => Op::LongCmp,
+
+        // --- loads / stores ---
+        O::Lload(n) => Op::LoadLong(*n),
+        O::Lstore(n) => Op::StoreLong(*n),
+        O::Aload(n) => Op::LoadRef(*n),
+        O::Astore(n) => Op::StoreRef(*n),
+
+        // --- fields ---
+        O::Getfield(m) => Op::GetField {
+            field: member(m),
+            wide: field_wide(m),
+        },
+        O::Putfield(m) => Op::PutField {
+            field: member(m),
+            wide: field_wide(m),
+        },
+        O::Getstatic(m) => Op::GetStatic {
+            field: member(m),
+            wide: field_wide(m),
+        },
+        O::Putstatic(m) => Op::PutStatic {
+            field: member(m),
+            wide: field_wide(m),
+        },
+
+        // --- calls ---
+        O::Invokestatic(m) => invoke(m, true),
+        O::Invokevirtual(m) | O::Invokespecial(m) => invoke(m, false),
+        O::Invokeinterface(m, _) => invoke(m, false),
+        // invokedynamic (lambdas / string concat) is not modelled — out of scope.
+        O::Invokedynamic(_) => Op::Other {
+            pops: 0,
+            pushes: vec![],
+        },
+
+        // --- control flow ---
+        O::Goto(j) => Op::Goto(target(*j)),
+        O::Ifeq(j) => Op::Branch {
+            target: target(*j),
+            pops: 1,
+            kind: code::BranchKind::IfEq,
+        },
+        O::Ifne(j) => Op::Branch {
+            target: target(*j),
+            pops: 1,
+            kind: code::BranchKind::IfNe,
+        },
+        O::Iflt(j) | O::Ifge(j) | O::Ifgt(j) | O::Ifle(j) | O::Ifnull(j) | O::Ifnonnull(j) => {
+            Op::Branch {
+                target: target(*j),
+                pops: 1,
+                kind: code::BranchKind::Other,
+            }
+        }
+        O::IfIcmpeq(j)
+        | O::IfIcmpne(j)
+        | O::IfIcmplt(j)
+        | O::IfIcmpge(j)
+        | O::IfIcmpgt(j)
+        | O::IfIcmple(j)
+        | O::IfAcmpeq(j)
+        | O::IfAcmpne(j) => Op::Branch {
+            target: target(*j),
+            pops: 2,
+            kind: code::BranchKind::Other,
+        },
+        O::Tableswitch(rt) => {
+            let mut targets = vec![target(rt.default)];
+            targets.extend(rt.jumps.iter().map(|j| target(*j)));
+            Op::Switch { targets }
+        }
+        O::Lookupswitch(lt) => {
+            let mut targets = vec![target(lt.default)];
+            targets.extend(lt.match_offsets.iter().map(|(_, j)| target(*j)));
+            Op::Switch { targets }
+        }
+        O::Ireturn | O::Lreturn | O::Freturn | O::Dreturn | O::Areturn => Op::Return { pops: 1 },
+        O::Return => Op::Return { pops: 0 },
+        O::Athrow => Op::Athrow,
+
+        // --- stack shuffles ---
+        O::Dup => Op::Dup,
+        O::Dup2 => Op::Dup2,
+        O::DupX1 => Op::DupX1,
+        O::DupX2 => Op::DupX2,
+        O::Dup2X1 => Op::Dup2X1,
+        O::Dup2X2 => Op::Dup2X2,
+        O::Pop => Op::Pop,
+        O::Pop2 => Op::Pop2,
+        O::Swap => Op::Swap,
+
+        // --- everything else: value-level stack effect only ---
+        O::Nop | O::Breakpoint | O::Impdep1 | O::Impdep2 | O::Iinc(..) | O::Ret(_) => Op::Other {
+            pops: 0,
+            pushes: vec![],
+        },
+        O::AconstNull
+        | O::IconstM1
+        | O::Iconst0
+        | O::Iconst1
+        | O::Iconst2
+        | O::Iconst3
+        | O::Iconst4
+        | O::Iconst5
+        | O::Fconst0
+        | O::Fconst1
+        | O::Fconst2
+        | O::Bipush(_)
+        | O::Sipush(_)
+        | O::Iload(_)
+        | O::Fload(_)
+        | O::Ldc(_)
+        | O::LdcW(_)
+        | O::Jsr(_)
+        | O::New(_) => Op::Other {
+            pops: 0,
+            pushes: vec![false],
+        },
+        O::Dconst0 | O::Dconst1 | O::Dload(_) => Op::Other {
+            pops: 0,
+            pushes: vec![true],
+        },
+        O::Istore(_) | O::Fstore(_) | O::Dstore(_) | O::Monitorenter | O::Monitorexit => {
+            Op::Other {
+                pops: 1,
+                pushes: vec![],
+            }
+        }
+        O::Ineg
+        | O::I2f
+        | O::I2b
+        | O::I2c
+        | O::I2s
+        | O::L2i
+        | O::L2f
+        | O::F2i
+        | O::Fneg
+        | O::D2i
+        | O::D2f
+        | O::Arraylength
+        | O::Checkcast(_)
+        | O::Instanceof(_)
+        | O::Newarray(_)
+        | O::Anewarray(_) => Op::Other {
+            pops: 1,
+            pushes: vec![false],
+        },
+        O::I2d | O::L2d | O::F2d | O::Dneg => Op::Other {
+            pops: 1,
+            pushes: vec![true],
+        },
+        O::Iadd
+        | O::Isub
+        | O::Imul
+        | O::Idiv
+        | O::Irem
+        | O::Iand
+        | O::Ior
+        | O::Ixor
+        | O::Ishl
+        | O::Ishr
+        | O::Iushr
+        | O::Fadd
+        | O::Fsub
+        | O::Fmul
+        | O::Fdiv
+        | O::Frem
+        | O::Fcmpg
+        | O::Fcmpl
+        | O::Dcmpg
+        | O::Dcmpl
+        | O::Iaload
+        | O::Baload
+        | O::Caload
+        | O::Saload
+        | O::Faload
+        | O::Aaload => Op::Other {
+            pops: 2,
+            pushes: vec![false],
+        },
+        O::Dadd | O::Dsub | O::Dmul | O::Ddiv | O::Drem | O::Daload | O::Laload => Op::Other {
+            pops: 2,
+            pushes: vec![true],
+        },
+        O::Iastore
+        | O::Bastore
+        | O::Castore
+        | O::Sastore
+        | O::Fastore
+        | O::Aastore
+        | O::Dastore
+        | O::Lastore => Op::Other {
+            pops: 3,
+            pushes: vec![],
+        },
+        O::Multianewarray(_, dims) => Op::Other {
+            pops: *dims,
+            pushes: vec![false],
+        },
+    }
 }

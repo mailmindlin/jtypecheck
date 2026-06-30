@@ -1,5 +1,7 @@
 package example;
 
+import java.util.Objects;
+
 import io.github.mailmindlin.jnisafe.Mut;
 import io.github.mailmindlin.jnisafe.Owned;
 import io.github.mailmindlin.jnisafe.Ref;
@@ -51,5 +53,16 @@ public class Flow {
         @Owned("Box<String>") long ptr = wrapString("qux");
         dropString(ptr);
         String value = get(ptr);
+    }
+
+    // W011: an owned handle that is never consumed before the method returns.
+    void test6(String param) {
+        @Owned("Box<String>") long ptr = wrapString("bar");
+        try {
+            Objects.requireNonNull(param);
+            dropString(ptr);
+        } catch (Exception e) {
+            // ptr not consumed
+        }
     }
 }

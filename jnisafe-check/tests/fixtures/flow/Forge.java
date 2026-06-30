@@ -19,4 +19,14 @@ public class Forge {
     void nullIntoNonNullable() {
         print(0L);
     }
+
+    // No E060: the literal 0 is a valid null pointer
+    void nullIntoNullable() {
+        dropString(0L);
+    }
+
+    // E060: the parameter is not a valid handle
+    void externalFabricate(long param) {
+        dropString(param);
+    }
 }

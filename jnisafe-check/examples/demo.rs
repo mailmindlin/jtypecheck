@@ -27,6 +27,7 @@ fn config(rust_crate: &str, java: &[&str]) -> Config {
     Config {
         rust_crate: PathBuf::from(rust_crate),
         java: java.iter().map(PathBuf::from).collect(),
+        flow: false,
         format: Format::Human,
         quiet: true,
         verbose: false,
@@ -136,6 +137,13 @@ fn main() -> ExitCode {
         },
     );
 
+    // --- Phase 6: Java-side handle-flow analysis (--flow) -------------------
+    ok &= flow_phase(
+        "flow: Java method bodies — handle leaks/forging/use-after-move (--flow)",
+        "jnisafe-check/tests/fixtures/classes/example/Flow.class",
+        &["W010", "W011", "E061", "E062", "E063"],
+    );
+
     if ok {
         println!("demo: all phases passed — correct layers accepted, broken layers rejected.");
         ExitCode::SUCCESS
@@ -143,6 +151,35 @@ fn main() -> ExitCode {
         eprintln!("demo: one or more phases did not match expectations.");
         ExitCode::from(1)
     }
+}
+
+/// Run the handle-flow analysis on one class and show what it catches inside the
+/// method bodies. Returns `true` when every expected code is present.
+fn flow_phase(title: &str, java: &str, codes: &[&str]) -> bool {
+    use jnisafe_check::diagnostics::Report;
+    use jnisafe_check::flow;
+
+    println!("== {title} ==");
+    let mut report = Report::default();
+    if let Err(e) = flow::analyze(&[PathBuf::from(java)], &mut report) {
+        eprintln!("FAIL: flow analysis errored: {e}\n");
+        return false;
+    }
+    print!("{}", report.render_human());
+
+    let mut ok = true;
+    for &code in codes {
+        if !report.has_code(code) {
+            ok = false;
+            eprintln!("FAIL: missing expected flow diagnostic {code}");
+        }
+    }
+    if ok {
+        println!("ok: flagged the expected handle-flow issues\n");
+    } else {
+        eprintln!();
+    }
+    ok
 }
 
 /// Run a negative phase: print the caught diagnostics, then assert the exact

@@ -28,6 +28,13 @@ pub struct Config {
     #[arg(long = "java", required = true, num_args = 1..)]
     pub java: Vec<PathBuf>,
 
+    /// Also run the Java-side handle-flow analysis (leaks, use-after-move,
+    /// forging, wrong-type, exposure, …) over the method bodies. Off by default:
+    /// it is intraprocedural and can flag legitimate-but-unannotated handle
+    /// patterns, so it is opt-in.
+    #[arg(long)]
+    pub flow: bool,
+
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Human)]
     pub format: Format,

@@ -14,11 +14,20 @@ public class OwnedFieldDisposed {
 
     private static native void drop(@Owned("Box<String>") long s);
 
-    void init() {
+    // No W012: in a constructor the field starts uninitialized (0).
+    OwnedFieldDisposed() {
         this.handle = wrap("x");
     }
 
     void close() {
+        // Ok: swap before consume
+        @Owned("Box<String>") long handle = this.handle;
+        this.handle = 0;
+        drop(handle);
+    }
+
+    void badClose() {
+        // Error: consumed before cleared
         drop(this.handle);
         this.handle = 0;
     }

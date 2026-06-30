@@ -52,6 +52,7 @@ fn config(rust_crate: PathBuf, java: Vec<PathBuf>) -> Config {
     Config {
         rust_crate,
         java,
+        flow: false,
         format: Format::Human,
         quiet: true,
         verbose: false,
@@ -227,7 +228,8 @@ fn overloaded_macro_methods_match_when_supported() {
     let report = run(&cfg).expect("run");
     assert!(
         !report.has_errors(),
-        "overloaded macro natives should match their Java declarations:\n{report}");
+        "overloaded macro natives should match their Java declarations:\n{report}"
+    );
 }
 
 #[test]
@@ -251,8 +253,7 @@ fn json_output_carries_codes() {
 
 #[test]
 fn java_loader_reads_pointer_annotations() {
-    let sigs =
-        java_loader::load(&[class("example/HandWritten.class")]).unwrap();
+    let sigs = java_loader::load(&[class("example/HandWritten.class")]).unwrap();
 
     let find = |method: &str| {
         sigs.iter()
@@ -367,35 +368,47 @@ fn flow_basic_cases() {
 
 #[test]
 fn flow_forging() {
-    // A fabricated constant and a literal-0-into-non-nullable, both E060.
+    // A fabricated constant, a literal-0-into-non-nullable, and an unannotated
+    // `long` parameter used as a handle — all E060. (`nullIntoNullable`, a 0 into
+    // a nullable @Owned slot, is fine.)
     let r = flow_report("example/Forge.class");
     assert_findings!(
         r,
         "E060" @ "fabricate",
         "E060" @ "nullIntoNonNullable",
+        "E060" @ "externalFabricate",
     );
 }
 
 #[test]
 fn flow_field_take_and_overwrite() {
-    // takeWithoutClear -> E064; overwriteLive -> W012.
     let r = flow_report("example/FieldTake.class");
+    // E064: consumed (or escaped via return) while still installed in the field.
+    // W012: per store-site — overwriteLive's two stores raise two.
+    // E060: in-place arithmetic on the field forges it.
+    // ctor / overwriteChecked (if==0) / overwriteAssert stay silent.
     assert_findings!(
         r,
         "E064" @ "takeWithoutClear",
+        "E064" @ "takeViaReturn",
+        "W012" @ "overwriteOnce",
         "W012" @ "overwriteLive",
+        "W012" @ "overwriteLive",
+        "E060" @ "mutate",
     );
 }
 
 #[test]
 fn flow_owned_field_never_disposed() {
     // No method consumes the owned field -> W013, pinned to the leaked field.
+    // (The constructor's store is exempt — the field starts at 0 — so no W012.)
     let leak = flow_report("example/OwnedFieldLeak.class");
     assert_findings!(leak, "W013" @ "handle");
 
-    // The control class disposes its field cleanly -> nothing.
+    // The control class disposes its field via the safe swap-then-consume in
+    // close(), so no W013; badClose() consumes before clearing -> E064.
     let ok = flow_report("example/OwnedFieldDisposed.class");
-    assert_findings!(ok);
+    assert_findings!(ok, "E064" @ "badClose");
 }
 
 #[test]
@@ -417,9 +430,17 @@ fn flow_exposed_handles() {
     // A public handle field (`exposed`) and a public handle-returning method
     // (`take`) each raise W014; the private `hidden` field stays silent.
     let r = flow_report("example/ExposeFlow.class");
+    // W014 is declaration-level (one per exposed surface): the public field, the
+    // public handle-returning method, and the public handle-taking methods.
+    // `clone` exposes a handle on both its return and a parameter, so it raises
+    // two. The private `hidden` field stays silent.
     assert_findings!(
         r,
         "W014" @ "exposed",
+        "W014" @ "clone",
+        "W014" @ "clone",
+        "W014" @ "makeUppercase",
+        "W014" @ "drop",
         "W014" @ "take",
     );
 }
@@ -430,4 +451,48 @@ fn flow_suppression_silences_category() {
     // in `suppressed()`, leaving only `active()`.
     let r = flow_report("example/SuppressFlow.class");
     assert_findings!(r, "E061" @ "active");
+}
+
+#[test]
+fn flow_lowers_bytecode() {
+    // Phase 2 sanity: `load_flow` decodes method bodies into the owned model.
+    // `Forge.fabricate` is `long p = 12345L; dropString(p);`.
+    use jnisafe_check::code::Op;
+    let classes = java_loader::load_flow(&[class("example/Forge.class")]).unwrap();
+    let forge = classes
+        .iter()
+        .find(|c| c.internal_name == "example/Forge")
+        .expect("Forge class");
+    let fab = forge
+        .methods
+        .iter()
+        .find(|m| m.name == "fabricate")
+        .expect("fabricate method");
+    let code = fab.code.as_ref().expect("fabricate has decoded bytecode");
+
+    assert!(
+        code.insns
+            .iter()
+            .any(|i| matches!(&i.op, Op::LongConst { zero: false })),
+        "expected a non-zero long constant"
+    );
+    assert!(
+        code.insns.iter().any(|i| matches!(&i.op, Op::StoreLong(_))),
+        "expected an lstore"
+    );
+    assert!(
+        code.insns.iter().any(|i| matches!(&i.op, Op::LoadLong(_))),
+        "expected an lload"
+    );
+    assert!(
+        code.insns.iter().any(
+            |i| matches!(&i.op, Op::Invoke { target, is_static: true, .. } if target.name == "dropString")
+        ),
+        "expected an invokestatic of dropString"
+    );
+    // Line numbers are present (fixtures compile with `javac -g`).
+    assert!(
+        code.insns.iter().any(|i| i.line.is_some()),
+        "expected a line-number mapping"
+    );
 }

@@ -12,7 +12,9 @@ public class OwnedFieldLeak {
 
     private static native @Owned("Box<String>") long wrap(String s);
 
-    void init() {
+    // No W012: in a constructor the field starts uninitialized (0), so this is
+    // not overwriting a live handle.
+    OwnedFieldLeak() {
         this.handle = wrap("x");
     }
 }

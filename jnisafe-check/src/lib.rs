@@ -5,9 +5,12 @@
 //! The two front-ends ([`java_loader`], [`rust_loader`]) lower into a shared IR
 //! ([`ir`]); [`check`] compares them and produces a [`diagnostics::Report`].
 
+pub mod cfg;
 pub mod check;
 pub mod cli;
+pub mod code;
 pub mod diagnostics;
+pub mod flow;
 pub mod ir;
 pub mod java_loader;
 pub mod mangle;
@@ -51,5 +54,9 @@ pub fn run(cfg: &cli::Config) -> Result<Report, RunError> {
     // Rust→Java: verify the methods/fields/constructors `bind_java_type!` calls
     // exist in the loaded classes.
     check::check_java_refs(&rust.java_refs, &java_models, &mut report);
+    // Java-side handle-flow analysis over method bodies (opt-in via `--flow`).
+    if cfg.flow {
+        flow::analyze(&cfg.java, &mut report)?;
+    }
     Ok(report)
 }
