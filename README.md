@@ -116,6 +116,18 @@ you keep the static check whichever style you adopt:
   verified and a warning (W004) is emitted. See
   [`bind_type.rs`](example/rust/src/bind_type.rs).
 
+* **Handle fields.** A jnisafe smart pointer can also *live in* a Java object — a
+  `long` field holding a `JOwned`/`JRef`/`JMut` handle across calls. Reconstruct
+  it on the Rust side with the `from_raw`/`into_raw` primitives, and store the
+  field on the Java side guarded by the `NativeObject` read/write-lock pattern so
+  every access reaches Rust as a parameter under a held lock (see
+  [`NativeObject.java`](example/java/example/NativeObject.java),
+  [`Document.java`](example/java/example/Document.java), and
+  [`document.rs`](example/rust/src/document.rs)). When a `long` field is declared
+  as a handle in `bind_java_type!`'s `fields { … }`, the checker cross-checks it
+  against the field's `@Owned`/`@Ref`/`@Mut` annotation: a mismatched pointee or
+  kind is **E045**, and a handle field with no annotation is **W005**.
+
 ### 4. Check that the two sides agree
 
 ```bash
