@@ -71,17 +71,16 @@ pub unsafe trait IntoJavaPtrMut: IntoJavaPtr {}
 unsafe impl<T: Send + 'static> IntoJavaPtrMut for Box<T> {}
 
 /// Assert at compile time that a `usize` address fits in a `jlong`.
-const _: () = assert!(size_of::<jlong>() >= size_of::<usize>(), "target pointer must fit within jlong");
+const _: () = assert!(
+    size_of::<jlong>() >= size_of::<usize>(),
+    "target pointer must fit within jlong"
+);
 
 /// Convert a raw pointer into a `jlong`, *exposing* its provenance so the
 /// address can later be turned back into a usable pointer with
 /// [`with_exposed_provenance`](std::ptr::with_exposed_provenance).
 pub(crate) fn expose_as_jlong<T>(ptr: NonNull<T>) -> NonZero<jlong> {
-    let raw = ptr
-        .as_ptr()
-        .expose_provenance()
-        .cast_signed()
-        as jlong;
+    let raw = ptr.as_ptr().expose_provenance().cast_signed() as jlong;
     NonZero::new(raw).unwrap()
 }
 

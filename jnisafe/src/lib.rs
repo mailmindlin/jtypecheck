@@ -8,7 +8,11 @@
 //! double-freed / bogus handles; in release the checks compile out and the
 //! wrappers are byte-for-byte a plain `jlong`.
 #![warn(clippy::pedantic)]
-#![forbid(clippy::missing_safety_doc, clippy::missing_panics_doc, clippy::missing_assert_message)]
+#![forbid(
+    clippy::missing_safety_doc,
+    clippy::missing_panics_doc,
+    clippy::missing_assert_message
+)]
 
 // --- Debug-only runtime handle validation ---------------------------------
 //
