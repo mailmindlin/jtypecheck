@@ -57,10 +57,32 @@ impl RustExtractor for SynBackend {
         if root.is_file() {
             extract_file(&root, &mut arts)?;
         } else {
+            // A crate's `src/**` routinely contains `.rs` files that are not
+            // standalone modules — `include!("codes.rs")` data fragments and the
+            // like — which `syn` cannot parse on their own. Such a file can never
+            // hold a top-level `Java_*` export or `bind_java_type!`, so skip parse
+            // failures and keep going (cargo build is the source of truth for
+            // genuine syntax errors); I/O errors are real and still abort.
+            let mut skipped: Vec<PathBuf> = Vec::new();
             for entry in walkdir::WalkDir::new(&root).into_iter().flatten() {
                 if entry.path().extension().is_some_and(|e| e == "rs") {
-                    extract_file(entry.path(), &mut arts)?;
+                    match extract_file(entry.path(), &mut arts) {
+                        Ok(()) => {}
+                        Err(RustLoadError::Parse(path, _)) => skipped.push(path),
+                        Err(err @ RustLoadError::Io(..)) => return Err(err),
+                    }
                 }
+            }
+            if !skipped.is_empty() {
+                let list = skipped
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "note: skipped {} unparseable Rust file(s) (e.g. `include!` fragments): {list}",
+                    skipped.len()
+                );
             }
         }
         resolve_overloads(&mut arts.natives);
