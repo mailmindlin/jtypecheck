@@ -99,6 +99,23 @@ impl<T: Send + Sync + 'static> JRef<'_, Arc<T>> {
     }
 }
 
+// `UnwindSafe`/`RefUnwindSafe` are advisory markers (like `AssertUnwindSafe`),
+// not `unsafe`: a wrong impl can only let a logically-torn value be observed
+// after a *caught* panic, never cause UB. A handle is layout-identical to a bare
+// `jlong`, and its pointee is owned by Java and only touched under Java's lock
+// discipline, so the pointee's own `UnwindSafe`-ness is irrelevant: letting the
+// auto-impl recurse into it would needlessly reject pointees that merely hold
+// thread pools / callbacks, which a native method never observes torn.
+//
+// We claim only what each handle's role justifies. `JRef` is a shared, read-only
+// handle, so both markers are natural. `JOwned` is owned (you move it, not share
+// it, across a `catch_unwind`) so only `UnwindSafe`. `JMut` is a mutable handle
+// (like `&mut T`, which is `!UnwindSafe` by default); it gets neither here, to be
+// added deliberately if a use ever needs it.
+impl<P: IntoJavaPtr> UnwindSafe for JRef<'_, P> {}
+impl<P: IntoJavaPtr> RefUnwindSafe for JRef<'_, P> {}
+impl<P: IntoJavaPtr> UnwindSafe for JOwned<P> {}
+
 /// Borrowed, non-null mutable pointer to a Java-owned Rust object.
 ///
 /// `Deref` is available for any [`IntoJavaPtr`]; `DerefMut` only for
