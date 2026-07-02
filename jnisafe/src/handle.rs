@@ -75,10 +75,29 @@ impl<T: IntoJavaPtr> JRef<'_, T> {
     }
 }
 
-impl<T: IntoJavaPtr + Send + Sync> UnwindSafe for JRef<'_, Arc<T>> {}
-impl<T: IntoJavaPtr + Send + Sync> RefUnwindSafe for JRef<'_, Arc<T>> {}
-impl<T: IntoJavaPtr + Send> UnwindSafe for JRef<'_, Box<T>> {}
-impl<T: IntoJavaPtr + Send> RefUnwindSafe for JRef<'_, Box<T>> {}
+impl<T: Send + Sync + 'static> JRef<'_, Arc<T>> {
+    /// Clone the underlying `Arc`, incrementing its strong count, without
+    /// consuming this borrowed handle.
+    ///
+    /// Java keeps ownership of the handle it lent us; the returned `Arc` is an
+    /// independent owner that must eventually be dropped (or handed back to
+    /// Java). Use this when a handle was reconstructed from a raw `jlong` read
+    /// out of a `long[]` or field (via [`from_raw`](Self::from_raw)) and the
+    /// Rust side needs to retain its own owner — e.g. holding a shared
+    /// `Arc<T>` in a builder while Java still owns the same object.
+    #[must_use]
+    pub fn clone_arc(&self) -> Arc<T> {
+        rt_validate!(self.internal, T, "JRef::clone_arc");
+        let ptr = from_exposed_jlong::<T>(self.internal);
+        // Safety: `ptr` was exposed from a live `Arc<T>` that Java owns for all
+        // of `'a`; incrementing the strong count and reconstructing yields one
+        // extra independent owner without taking the count Java holds.
+        unsafe {
+            Arc::increment_strong_count(ptr);
+            Arc::from_raw(ptr)
+        }
+    }
+}
 
 /// Borrowed, non-null mutable pointer to a Java-owned Rust object.
 ///
@@ -224,11 +243,15 @@ impl<T: IntoJavaPtr> JOwned<T> {
         let internal = this.internal?;
         rt_validate!(internal, T::Target, "JOwned::into_inner");
         rt_deregister!(internal, "JOwned::into_inner");
-        let mut ptr = from_exposed_jlong_mut::<T::Target>(internal);
+        let ptr = from_exposed_jlong_mut::<T::Target>(internal);
         // Safety: a non-null `internal` was produced by `From`, which stored
         // a pointer from `IntoJavaPtr::to_raw`; we reconstruct exactly once
-        // and suppress `Drop` via `ManuallyDrop`.
-        Some(unsafe { T::from_raw(ptr.as_mut()) })
+        // and suppress `Drop` via `ManuallyDrop`. Use `as_ptr()` (not
+        // `as_mut()`): a `&mut Target` would narrow provenance to the pointee,
+        // and for `Arc` the refcount header lives *before* the pointee, so the
+        // reconstructed `Arc`'s drop would touch memory outside that narrowed
+        // provenance (UB under Stacked Borrows). `Drop` already does this.
+        Some(unsafe { T::from_raw(ptr.as_ptr()) })
     }
 
     /// Get a reference to the contained value
@@ -240,8 +263,13 @@ impl<T: IntoJavaPtr> JOwned<T> {
         unsafe { ptr.as_ref() }
     }
 
-    /// Get a mutable reference to the contained value
-    pub fn get_mut(&mut self) -> Option<&mut T::Target> {
+    /// Get a mutable reference to the contained value. Requires `T:
+    /// IntoJavaPtrMut` (`Box`, not `Arc`): handing out `&mut` into a shared
+    /// `Arc` pointee would alias any other clone and is unsound.
+    pub fn get_mut(&mut self) -> Option<&mut T::Target>
+    where
+        T: IntoJavaPtrMut,
+    {
         let internal = self.internal?;
         rt_validate!(internal, T::Target, "JOwned::get_mut");
         let mut ptr = from_exposed_jlong_mut::<T::Target>(internal);
@@ -509,6 +537,28 @@ mod tests {
         );
         assert_eq!(size_of::<JRef<'static, Box<String>>>(), size_of::<jlong>());
         assert_eq!(size_of::<JMut<'static, Box<String>>>(), size_of::<jlong>());
+    }
+
+    #[test]
+    fn jref_clone_arc_adds_owner() {
+        let owned: JOwned<Arc<u64>> = Arc::new(42u64).into();
+        let addr = owned.internal.expect("non-null after From");
+        let r: JRef<'static, Arc<u64>> = JRef {
+            internal: addr,
+            lifetime: PhantomData,
+        };
+        let cloned = r.clone_arc();
+        assert_eq!(*cloned, 42);
+        assert_eq!(
+            Arc::strong_count(&cloned),
+            2,
+            "clone_arc bumps the strong count (Java's owner + this clone)"
+        );
+        // Dropping the clone leaves Java's owner (the JOwned) intact...
+        drop(cloned);
+        assert_eq!(owned.get().copied(), Some(42));
+        // ...and the JOwned still frees exactly once.
+        drop(owned);
     }
 
     // --- Debug-only runtime-validation tests ------------------------------
