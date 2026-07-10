@@ -50,15 +50,18 @@ it, so the checker has something concrete to accept or reject:
 | `incorrect_calls/` | `IncorrectCalls.java`  | `wrong.rs`   | Rust→Java call bindings (methods/fields/constructors, E040–E044/W004) |
 | `field_handles/`   | `FieldHandles.java`    | `wrong.rs`   | Handle fields: `@Owned`/`@Ref`/`@Mut` annotation vs Rust handle type (E045 mismatch, W005 unannotated) |
 | `overloaded/`      | *(uses `Overloaded`)*  | `natives.rs` | **Positive:** overloaded `native_method!` natives resolve cleanly |
+| `arrays/`          | `Arrays.java`          | `natives.rs` | **Positive:** array natives via `JPrimitiveArray<T>`/`JObjectArray<E>` match `int[]`/`String[]`/`Object[]`/`byte[][]` |
 
 The `*.rs` files are **not compiled** — the Rust loader parses them with `syn`
 (it only ever reads `*.rs`, so the co-located `.java` is ignored). In the
 `wrong.rs` cases each function reproduces its Java counterpart's mangled symbol
 but disagrees in exactly one way, so the checker emits one diagnostic per case;
-the expected code is documented in the Java file's comments. `overloaded/` is a
-*correct* case (hence `natives.rs`, not `wrong.rs`) — a minimal isolated crate so
-overload resolution is tested without the other example natives; its Java class,
-`Overloaded`, is a correct example under `example/java`.
+the expected code is documented in the Java file's comments. `overloaded/` and
+`arrays/` are *correct* cases (hence `natives.rs`, not `wrong.rs`) — minimal
+isolated crates that assert a clean match: `overloaded/` exercises overload
+resolution without the other example natives (its Java class, `Overloaded`, is a
+correct example under `example/java`), and `arrays/` exercises the generic jni
+array wrappers against a self-contained `Arrays.java`.
 
 ### Generated `.class` files
 
