@@ -1,20 +1,19 @@
 name: Release crates
 
-# Manual publish to crates.io. Pick the crate to release; the workflow builds,
-# tests, and `cargo publish`es it. Requires a CARGO_REGISTRY_TOKEN repo secret
-# (Settings → Secrets and variables → Actions). Note: each crate's Cargo.toml
-# must carry `description`, `license`, and `repository` before crates.io will
-# accept it.
+# Publishes both crates to crates.io. Fires automatically when you publish a
+# GitHub Release (tag vX.Y.Z), and can still be run by hand from the Actions tab.
+#
+# Requires a CARGO_REGISTRY_TOKEN repo secret (Settings → Secrets and variables →
+# Actions). Each crate's Cargo.toml must carry `description`, `license`, and
+# `repository` before crates.io will accept it.
+#
+# NOTE: crates.io rejects republishing an existing version, so every release must
+# bump `version` in the workspace Cargo.toml. The version-check step below fails
+# fast if the manifest version doesn't match the release tag.
 on:
+  release:
+    types: [published]
   workflow_dispatch:
-    inputs:
-      crate:
-        description: Crate to publish
-        required: true
-        type: choice
-        options:
-          - jnisafe
-          - jnisafe-check
 
 permissions:
   contents: read
@@ -31,10 +30,29 @@ jobs:
           pixi-version: v0.66.0
           cache: true
 
+      # On a release, guard against forgetting to bump: the workspace version
+      # must equal the tag (with the leading "v" stripped, e.g. v0.2.0 -> 0.2.0).
+      - name: Check version matches tag
+        if: github.event_name == 'release'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "tag=$tag  manifest=$manifest"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::Release tag ($tag) does not match Cargo.toml version ($manifest). Bump the version before releasing."
+            exit 1
+          fi
+
       - name: Test
         run: pixi run test
 
-      - name: Publish ${{ inputs.crate }}
-        run: pixi run cargo publish -p ${{ inputs.crate }}
+      # jnisafe first (it's the library other crates may depend on), then the checker.
+      - name: Publish jnisafe
+        run: pixi run cargo publish -p jnisafe
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish jnisafe-check
+        run: pixi run cargo publish -p jnisafe-check
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

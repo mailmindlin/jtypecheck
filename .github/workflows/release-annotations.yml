@@ -6,7 +6,12 @@ name: Release annotations
 #   MAVEN_CENTRAL_USERNAME / MAVEN_CENTRAL_PASSWORD  — a Central Portal user token
 #   GPG_PRIVATE_KEY                                  — ASCII-armored private key
 #   MAVEN_GPG_PASSPHRASE                             — that key's passphrase
+#
+# One-time prerequisite: verify the io.github.mailmindlin namespace on the
+# Sonatype Central Portal before the first deploy will be accepted.
 on:
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
