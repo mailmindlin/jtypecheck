@@ -17,6 +17,10 @@ pub enum Format {
     name = "jnisafe-check",
     about = "Validate that a Rust/Java JNI layer agrees on names, signatures, and pointer types."
 )]
+// New flags are added as fields over time; `#[non_exhaustive]` keeps that from
+// breaking library callers. Build one with [`Config::parse`] (CLI) or
+// [`Config::new`] (programmatic), then set the public fields you need.
+#[non_exhaustive]
 pub struct Config {
     /// Path to the Rust crate root (its `src/**/*.rs` is scanned), or a single
     /// `.rs` file.
@@ -57,6 +61,23 @@ pub struct Config {
 }
 
 impl Config {
+    /// Build a `Config` programmatically (the CLI uses the derived
+    /// [`Config::parse`]). Everything but the two required inputs takes its CLI
+    /// default; set the remaining public fields afterwards as needed. `java_home`
+    /// defaults to `None`, so [`Config::effective_java_home`] still falls back to
+    /// `$JAVA_HOME`.
+    pub fn new(rust_crate: PathBuf, java: Vec<PathBuf>) -> Self {
+        Config {
+            rust_crate,
+            java,
+            java_home: None,
+            flow: false,
+            format: Format::Human,
+            quiet: false,
+            verbose: false,
+        }
+    }
+
     /// The effective JDK home for resolving stdlib classes: the `--java-home`
     /// flag if given, else the `JAVA_HOME` environment variable, else `None`.
     pub fn effective_java_home(&self) -> Option<PathBuf> {

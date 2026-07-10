@@ -259,7 +259,11 @@ pub struct JavaRef {
 
 /// The callable surface of a Java class, used to verify [`JavaRef`]s. Built by
 /// the Java loader from all (not just native) methods, fields, and `<init>`s.
+/// `#[non_exhaustive]`: only the loader constructs these, and the set of fields
+/// grows as the checker learns to read more of a class (it just gained supertype
+/// links) — that shouldn't break library callers.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct JavaClassModel {
     /// Internal binary name, e.g. `example/BindTypeExample`.
     pub internal_name: String,

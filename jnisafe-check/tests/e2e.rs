@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use jnisafe_check::cli::{Config, Format};
+use jnisafe_check::cli::Config;
 use jnisafe_check::diagnostics::{Diagnostic, Report};
 use jnisafe_check::ir::{IrType, PointerKind, Receiver};
 use jnisafe_check::rust_loader::{RustExtractor, SynBackend};
@@ -50,17 +50,11 @@ fn example_rust() -> PathBuf {
 }
 
 fn config(rust_crate: PathBuf, java: Vec<PathBuf>) -> Config {
-    Config {
-        rust_crate,
-        java,
-        // Default to `$JAVA_HOME` so JDK stdlib bindings can be resolved; harmless
-        // for fixtures that reference no JDK types (no resolution is triggered).
-        java_home: std::env::var_os("JAVA_HOME").map(PathBuf::from),
-        flow: false,
-        format: Format::Human,
-        quiet: true,
-        verbose: false,
-    }
+    let mut cfg = Config::new(rust_crate, java);
+    cfg.quiet = true;
+    // `java_home` stays `None`; `effective_java_home()` falls back to `$JAVA_HOME`
+    // so JDK stdlib bindings still resolve where the JDK tests need them.
+    cfg
 }
 
 /// A usable JDK home for the JDK-resolution tests: `$JAVA_HOME` if set and it
