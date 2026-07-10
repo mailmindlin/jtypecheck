@@ -78,6 +78,18 @@ pub fn rust_simple_type(name: &str) -> Option<IrType> {
     })
 }
 
+/// Build the array type whose element is `elem`, for the generic wrappers
+/// `JPrimitiveArray<T>` / `JObjectArray<E>`. The result is a [`IrType::JavaObject`]
+/// whose `class` holds the full JVM array descriptor (`[I`, `[Ljava/lang/String;`,
+/// or `[[B` for nested arrays). Returns `None` when `elem` has no field
+/// descriptor (e.g. `void`, a handle, or an unsupported type).
+pub fn array_of(elem: &IrType) -> Option<IrType> {
+    let desc = elem.jni_field_descriptor()?;
+    Some(IrType::JavaObject {
+        class: format!("[{desc}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

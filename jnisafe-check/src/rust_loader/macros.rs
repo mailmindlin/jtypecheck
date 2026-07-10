@@ -19,6 +19,7 @@ use syn::parse::{Parse, ParseStream};
 use syn::visit::Visit;
 use syn::{Ident, Token, Type};
 
+use super::TypeRegistry;
 use crate::ir::{
     IrType, JavaRef, JavaRefKind, MethodKey, Origin, Receiver, RustExportProblem, Signature, SrcLoc,
 };
@@ -39,19 +40,59 @@ mod kw {
 pub fn collect(
     file: &syn::File,
     path: &Path,
+    reg: &TypeRegistry,
     natives: &mut Vec<Signature>,
     refs: &mut Vec<JavaRef>,
 ) {
     MacroVisitor {
         path,
+        reg,
         natives,
         refs,
     }
     .visit_file(file);
 }
 
+/// Pre-pass: record each `bind_java_type!` shorthand header's Rust-wrapper-type →
+/// internal-Java-class binding (e.g. `JPose` → `example/Pose`) into `out`, without
+/// lowering any signatures. Feeds the [`TypeRegistry`] the main pass lowers against.
+pub fn collect_type_map(file: &syn::File, out: &mut TypeRegistry) {
+    TypeMapVisitor { out }.visit_file(file);
+}
+
+struct TypeMapVisitor<'a> {
+    out: &'a mut TypeRegistry,
+}
+
+impl<'ast> Visit<'ast> for TypeMapVisitor<'_> {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if mac
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .as_deref()
+            != Some("bind_java_type")
+        {
+            return;
+        }
+        if let Some(entry) = split_top_level_commas(mac.tokens.clone())
+            .into_iter()
+            .next()
+            && let Ok(header) = syn::parse2::<BindHeader>(entry)
+            && let Some(rust_type) = header.rust_type
+        {
+            self.out.insert(
+                rust_type,
+                crate::mangle::class_dotted_to_internal(&header.class),
+            );
+        }
+    }
+}
+
 struct MacroVisitor<'a> {
     path: &'a Path,
+    reg: &'a TypeRegistry,
     natives: &'a mut Vec<Signature>,
     refs: &'a mut Vec<JavaRef>,
 }
@@ -69,12 +110,21 @@ impl<'ast> Visit<'ast> for MacroVisitor<'_> {
             .filter(|&l| l > 0);
         match name.as_str() {
             "native_method" => {
-                if let Some(sig) = parse_native_method(mac.tokens.clone(), self.path, line) {
+                if let Some(sig) =
+                    parse_native_method(mac.tokens.clone(), self.path, line, self.reg)
+                {
                     self.natives.push(sig);
                 }
             }
             "bind_java_type" => {
-                parse_bind_java_type(mac.tokens.clone(), self.path, line, self.natives, self.refs);
+                parse_bind_java_type(
+                    mac.tokens.clone(),
+                    self.path,
+                    line,
+                    self.reg,
+                    self.natives,
+                    self.refs,
+                );
             }
             _ => {}
         }
@@ -89,8 +139,10 @@ struct MethodSpec {
     name_override: Option<String>,
     raw_fn_name: Option<String>,
     is_static: bool,
-    params: Vec<IrType>,
-    ret: IrType,
+    /// Raw parameter types; lowered to IR at build time against the registry.
+    params: Vec<Type>,
+    /// Raw return type; `None` is void. Lowered at build time.
+    ret: Option<Type>,
     /// True once we have a parameter/return signature (shorthand or `sig =`).
     have_sig: bool,
 }
@@ -103,7 +155,7 @@ impl MethodSpec {
             raw_fn_name: None,
             is_static: false,
             params: Vec::new(),
-            ret: IrType::Void,
+            ret: None,
             have_sig: false,
         }
     }
@@ -119,12 +171,17 @@ impl MethodSpec {
 
 /// Parse a whole `native_method! { … }` body. Properties and the inline `fn`
 /// shorthand are independent top-level (comma-separated) entries that we merge.
-fn parse_native_method(tokens: TokenStream, path: &Path, line: Option<usize>) -> Option<Signature> {
+fn parse_native_method(
+    tokens: TokenStream,
+    path: &Path,
+    line: Option<usize>,
+    reg: &TypeRegistry,
+) -> Option<Signature> {
     let mut spec = MethodSpec::new();
     for entry in split_top_level_commas(tokens) {
         apply_entry(entry, &mut spec);
     }
-    build_signature(&spec, spec.java_type.clone(), path, line)
+    build_signature(&spec, spec.java_type.clone(), path, line, reg)
 }
 
 /// Parse a `bind_java_type! { … }` body: pull the class from the header, then
@@ -135,6 +192,7 @@ fn parse_bind_java_type(
     tokens: TokenStream,
     path: &Path,
     line: Option<usize>,
+    reg: &TypeRegistry,
     natives: &mut Vec<Signature>,
     refs: &mut Vec<JavaRef>,
 ) {
@@ -152,28 +210,29 @@ fn parse_bind_java_type(
                 for method in split_top_level_commas(block) {
                     let mut spec = MethodSpec::new();
                     apply_entry(method, &mut spec);
-                    if let Some(sig) = build_signature(&spec, Some(class.clone()), path, line) {
+                    if let Some(sig) = build_signature(&spec, Some(class.clone()), path, line, reg)
+                    {
                         natives.push(sig);
                     }
                 }
             }
             "methods" => {
                 for e in split_top_level_commas(block) {
-                    if let Some(r) = parse_method_ref(e, &class_internal, path, line) {
+                    if let Some(r) = parse_method_ref(e, &class_internal, path, line, reg) {
                         refs.push(r);
                     }
                 }
             }
             "constructors" => {
                 for e in split_top_level_commas(block) {
-                    if let Some(r) = parse_ctor_ref(e, &class_internal, path, line) {
+                    if let Some(r) = parse_ctor_ref(e, &class_internal, path, line, reg) {
                         refs.push(r);
                     }
                 }
             }
             "fields" => {
                 for e in split_top_level_commas(block) {
-                    if let Some(r) = parse_field_ref(e, &class_internal, path, line) {
+                    if let Some(r) = parse_field_ref(e, &class_internal, path, line, reg) {
                         refs.push(r);
                     }
                 }
@@ -198,6 +257,7 @@ fn parse_method_ref(
     class_internal: &str,
     path: &Path,
     line: Option<usize>,
+    reg: &TypeRegistry,
 ) -> Option<JavaRef> {
     let Ok(Entry::Method {
         is_static,
@@ -217,8 +277,8 @@ fn parse_method_ref(
         kind: JavaRefKind::Method,
         java_name,
         is_static,
-        params,
-        ret,
+        params: lower_params(&params, reg),
+        ret: lower_ret(&ret, reg),
         field_ty: None,
     })
 }
@@ -230,6 +290,7 @@ fn parse_ctor_ref(
     class_internal: &str,
     path: &Path,
     line: Option<usize>,
+    reg: &TypeRegistry,
 ) -> Option<JavaRef> {
     let Ok(Entry::Method { params, .. }) = syn::parse2::<Entry>(entry) else {
         return None;
@@ -240,7 +301,7 @@ fn parse_ctor_ref(
         kind: JavaRefKind::Constructor,
         java_name: "<init>".to_owned(),
         is_static: false,
-        params,
+        params: lower_params(&params, reg),
         ret: IrType::Void,
         field_ty: None,
     })
@@ -252,6 +313,7 @@ fn parse_field_ref(
     class_internal: &str,
     path: &Path,
     line: Option<usize>,
+    reg: &TypeRegistry,
 ) -> Option<JavaRef> {
     let fe = syn::parse2::<FieldEntry>(entry).ok()?;
     let java_name = fe
@@ -265,7 +327,7 @@ fn parse_field_ref(
         is_static: fe.is_static,
         params: Vec::new(),
         ret: IrType::Void,
-        field_ty: Some(fe.ty),
+        field_ty: Some(super::lower_type(&fe.ty, reg)),
     })
 }
 
@@ -276,6 +338,7 @@ fn build_signature(
     java_type: Option<String>,
     path: &Path,
     line: Option<usize>,
+    reg: &TypeRegistry,
 ) -> Option<Signature> {
     let java_type = java_type?;
     let method = spec.method_name()?;
@@ -297,8 +360,8 @@ fn build_signature(
         },
         is_static: false,
         receiver,
-        params: spec.params.clone(),
-        ret: spec.ret.clone(),
+        params: lower_params(&spec.params, reg),
+        ret: lower_ret(&spec.ret, reg),
         origin: Origin {
             rust: Some(SrcLoc {
                 file: path.to_path_buf(),
@@ -348,15 +411,15 @@ enum Entry {
     Name(String),
     StaticFlag(bool),
     Sig {
-        params: Vec<IrType>,
-        ret: IrType,
+        params: Vec<Type>,
+        ret: Option<Type>,
     },
     Method {
         is_static: bool,
         raw_fn_name: String,
         name_override: Option<String>,
-        params: Vec<IrType>,
-        ret: IrType,
+        params: Vec<Type>,
+        ret: Option<Type>,
     },
     Other,
 }
@@ -453,7 +516,7 @@ fn parse_method(input: ParseStream) -> syn::Result<Entry> {
 }
 
 /// Parse a `(params) [-> ret]` signature body (the `sig = …` property form).
-fn parse_sig_body(input: ParseStream) -> syn::Result<(Vec<IrType>, IrType)> {
+fn parse_sig_body(input: ParseStream) -> syn::Result<(Vec<Type>, Option<Type>)> {
     let content;
     syn::parenthesized!(content in input);
     let params = parse_params(&content)?;
@@ -461,20 +524,20 @@ fn parse_sig_body(input: ParseStream) -> syn::Result<(Vec<IrType>, IrType)> {
     Ok((params, ret))
 }
 
-/// Parse an optional `-> Type` return (absent ⇒ void).
-fn parse_arrow_ret(input: ParseStream) -> syn::Result<IrType> {
+/// Parse an optional `-> Type` return (absent ⇒ `None`, i.e. void). The type is
+/// captured raw and lowered later against the registry (see [`lower_ret`]).
+fn parse_arrow_ret(input: ParseStream) -> syn::Result<Option<Type>> {
     if input.peek(Token![->]) {
         input.parse::<Token![->]>()?;
-        let ty: Type = input.parse()?;
-        Ok(lower_ret(&ty))
+        Ok(Some(input.parse()?))
     } else {
-        Ok(IrType::Void)
+        Ok(None)
     }
 }
 
-/// Parse a comma-separated parameter list of `[name :] [&] TYPE`, lowering each
-/// type with the shared [`super::lower_type`].
-fn parse_params(content: ParseStream) -> syn::Result<Vec<IrType>> {
+/// Parse a comma-separated parameter list of `[name :] [&] TYPE`, capturing each
+/// type raw (lowered later against the registry).
+fn parse_params(content: ParseStream) -> syn::Result<Vec<Type>> {
     let mut out = Vec::new();
     while !content.is_empty() {
         // Optional `name :` (a single colon distinguishes it from a `::` path).
@@ -486,8 +549,7 @@ fn parse_params(content: ParseStream) -> syn::Result<Vec<IrType>> {
         if content.peek(Token![&]) {
             content.parse::<Token![&]>()?;
         }
-        let ty: Type = content.parse()?;
-        out.push(super::lower_type(&ty));
+        out.push(content.parse()?);
         if !content.is_empty() {
             content.parse::<Token![,]>()?;
         }
@@ -495,12 +557,18 @@ fn parse_params(content: ParseStream) -> syn::Result<Vec<IrType>> {
     Ok(out)
 }
 
-/// Lower a return type, mapping `void` and `()` to [`IrType::Void`].
-fn lower_ret(ty: &Type) -> IrType {
-    match ty {
-        Type::Tuple(t) if t.elems.is_empty() => IrType::Void,
-        Type::Path(p) if p.path.is_ident("void") => IrType::Void,
-        _ => super::lower_type(ty),
+/// Lower raw parameter types against the registry.
+fn lower_params(params: &[Type], reg: &TypeRegistry) -> Vec<IrType> {
+    params.iter().map(|t| super::lower_type(t, reg)).collect()
+}
+
+/// Lower a raw return type: `None` (no `-> …`) and `-> ()` / `-> void` are void.
+fn lower_ret(ret: &Option<Type>, reg: &TypeRegistry) -> IrType {
+    match ret {
+        None => IrType::Void,
+        Some(Type::Tuple(t)) if t.elems.is_empty() => IrType::Void,
+        Some(Type::Path(p)) if p.path.is_ident("void") => IrType::Void,
+        Some(ty) => super::lower_type(ty, reg),
     }
 }
 
@@ -525,6 +593,10 @@ fn bind_header_class(entry: TokenStream) -> Option<String> {
 
 struct BindHeader {
     class: String,
+    /// The Rust wrapper type's name in the shorthand form (`JPose` in
+    /// `pub JPose => "…"`); `None` for the `java_type = <class>` form, which
+    /// declares no wrapper type. Keyed on by the [`TypeRegistry`].
+    rust_type: Option<String>,
 }
 
 impl Parse for BindHeader {
@@ -542,14 +614,16 @@ impl Parse for BindHeader {
             input.parse::<Token![=]>()?;
             return Ok(BindHeader {
                 class: parse_java_class_name(input)?,
+                rust_type: None,
             });
         }
         // Shorthand `[pub] RustType => <class>` form.
         let _vis: syn::Visibility = input.parse()?;
-        let _rust_type: syn::Path = input.parse()?;
+        let rust_type: syn::Path = input.parse()?;
         input.parse::<Token![=>]>()?;
         Ok(BindHeader {
             class: parse_java_class_name(input)?,
+            rust_type: rust_type.segments.last().map(|s| s.ident.to_string()),
         })
     }
 }
@@ -583,7 +657,8 @@ struct FieldEntry {
     /// The Rust field name (camel-cased into the Java name unless overridden).
     raw_name: String,
     name_override: Option<String>,
-    ty: IrType,
+    /// Raw field type; lowered against the registry in [`parse_field_ref`].
+    ty: Type,
 }
 
 impl Parse for FieldEntry {
@@ -612,7 +687,7 @@ impl Parse for FieldEntry {
             let mut blk_static = false;
             for e in split_top_level_commas(body.parse()?) {
                 match syn::parse2::<FieldProp>(e) {
-                    Ok(FieldProp::Sig(t)) => ty = Some(t),
+                    Ok(FieldProp::Sig(t)) => ty = Some(*t),
                     Ok(FieldProp::Name(n)) => name_override = Some(n),
                     Ok(FieldProp::Static(b)) => blk_static = b,
                     Ok(FieldProp::Other) | Err(_) => {}
@@ -629,19 +704,19 @@ impl Parse for FieldEntry {
 
         // Shorthand: `name: Type`.
         input.parse::<Token![:]>()?;
-        let ty: Type = input.parse()?;
         Ok(FieldEntry {
             is_static,
             raw_name,
             name_override: None,
-            ty: super::lower_type(&ty),
+            ty: input.parse()?,
         })
     }
 }
 
 /// A property inside a `fields { name { … } }` block we care about.
 enum FieldProp {
-    Sig(IrType),
+    // Boxed: `syn::Type` is large, and this variant would otherwise dwarf the rest.
+    Sig(Box<Type>),
     Name(String),
     Static(bool),
     Other,
@@ -652,8 +727,7 @@ impl Parse for FieldProp {
         if input.peek(kw::sig) {
             input.parse::<kw::sig>()?;
             input.parse::<Token![=]>()?;
-            let ty: Type = input.parse()?;
-            return Ok(FieldProp::Sig(super::lower_type(&ty)));
+            return Ok(FieldProp::Sig(Box::new(input.parse()?)));
         }
         if input.peek(kw::name) {
             input.parse::<kw::name>()?;
@@ -702,9 +776,17 @@ mod tests {
 
     fn collect_all(src: &str) -> (Vec<Signature>, Vec<JavaRef>) {
         let file = syn::parse_file(src).unwrap();
+        let mut registry = TypeRegistry::new();
+        collect_type_map(&file, &mut registry);
         let mut natives = Vec::new();
         let mut refs = Vec::new();
-        collect(&file, Path::new("lib.rs"), &mut natives, &mut refs);
+        collect(
+            &file,
+            Path::new("lib.rs"),
+            &registry,
+            &mut natives,
+            &mut refs,
+        );
         (natives, refs)
     }
 

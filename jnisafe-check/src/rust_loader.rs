@@ -3,6 +3,7 @@
 //! [`Signature`]. Hidden behind the [`RustExtractor`] trait so a future
 //! rust-analyzer backend can replace it without touching the matcher.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use quote::ToTokens;
@@ -15,6 +16,13 @@ use crate::ir::{
 use crate::typemap;
 
 mod macros;
+
+/// Maps a `bind_java_type!`-declared Rust wrapper type to the internal name of the
+/// Java class it binds (e.g. `JPose` → `example/Pose`). Built up-front from every
+/// `bind_java_type!` header so [`lower_type`] can resolve an object type named by a
+/// user wrapper — bare or as a `JObjectArray` element — to its Java class,
+/// independent of the order files are parsed.
+pub(crate) type TypeRegistry = HashMap<String, String>;
 
 /// What the Rust front-end extracts from a crate: native-method signatures
 /// (Java→Rust, matched by symbol) plus the Rust→Java call bindings declared by
@@ -43,7 +51,6 @@ pub struct SynBackend;
 
 impl RustExtractor for SynBackend {
     fn extract(&self, crate_dir: &Path) -> Result<RustArtifacts, RustLoadError> {
-        let mut arts = RustArtifacts::default();
         // `src/**/*.rs` if a crate root; otherwise treat the path itself / its
         // tree as the source set (lets tests point at a single fixture file).
         let root = {
@@ -54,40 +61,79 @@ impl RustExtractor for SynBackend {
                 crate_dir.to_path_buf()
             }
         };
-        if root.is_file() {
-            extract_file(&root, &mut arts)?;
-        } else {
-            // A crate's `src/**` routinely contains `.rs` files that are not
-            // standalone modules — `include!("codes.rs")` data fragments and the
-            // like — which `syn` cannot parse on their own. Such a file can never
-            // hold a top-level `Java_*` export or `bind_java_type!`, so skip parse
-            // failures and keep going (cargo build is the source of truth for
-            // genuine syntax errors); I/O errors are real and still abort.
-            let mut skipped: Vec<PathBuf> = Vec::new();
-            for entry in walkdir::WalkDir::new(&root).into_iter().flatten() {
-                if entry.path().extension().is_some_and(|e| e == "rs") {
-                    match extract_file(entry.path(), &mut arts) {
-                        Ok(()) => {}
-                        Err(RustLoadError::Parse(path, _)) => skipped.push(path),
-                        Err(err @ RustLoadError::Io(..)) => return Err(err),
-                    }
+        let files = parse_sources(&root)?;
+
+        // Pre-pass: collect every `bind_java_type!` type binding first, so a native
+        // in one file can reference a wrapper declared in another — resolution is
+        // independent of walk order.
+        let mut registry = TypeRegistry::new();
+        for (_, file) in &files {
+            macros::collect_type_map(file, &mut registry);
+        }
+
+        // Main pass: lower native signatures and Rust→Java call bindings, resolving
+        // object types against the registry.
+        let mut arts = RustArtifacts::default();
+        for (path, file) in &files {
+            for item in &file.items {
+                if let Item::Fn(f) = item
+                    && let Some(sig) = lower_fn(f, path, &registry)
+                {
+                    arts.natives.push(sig);
                 }
             }
-            if !skipped.is_empty() {
-                let list = skipped
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                eprintln!(
-                    "note: skipped {} unparseable Rust file(s) (e.g. `include!` fragments): {list}",
-                    skipped.len()
-                );
-            }
+            macros::collect(
+                file,
+                path,
+                &registry,
+                &mut arts.natives,
+                &mut arts.java_refs,
+            );
         }
         resolve_overloads(&mut arts.natives);
         Ok(arts)
     }
+}
+
+/// Parse the crate's Rust sources into ASTs. A single `.rs` file is parsed
+/// directly; a directory is walked for `*.rs`. A crate's `src/**` routinely holds
+/// `.rs` files that aren't standalone modules — `include!("codes.rs")` fragments
+/// and the like — which `syn` can't parse alone; such a file can never hold a
+/// top-level `Java_*` export or `bind_java_type!`, so parse failures are skipped
+/// (cargo build is the source of truth for real syntax errors). I/O errors abort.
+fn parse_sources(root: &Path) -> Result<Vec<(PathBuf, syn::File)>, RustLoadError> {
+    if root.is_file() {
+        return Ok(vec![(root.to_path_buf(), read_parse(root)?)]);
+    }
+    let mut files = Vec::new();
+    let mut skipped: Vec<PathBuf> = Vec::new();
+    for entry in walkdir::WalkDir::new(root).into_iter().flatten() {
+        if entry.path().extension().is_some_and(|e| e == "rs") {
+            match read_parse(entry.path()) {
+                Ok(file) => files.push((entry.path().to_path_buf(), file)),
+                Err(RustLoadError::Parse(path, _)) => skipped.push(path),
+                Err(err @ RustLoadError::Io(..)) => return Err(err),
+            }
+        }
+    }
+    if !skipped.is_empty() {
+        let list = skipped
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "note: skipped {} unparseable Rust file(s) (e.g. `include!` fragments): {list}",
+            skipped.len()
+        );
+    }
+    Ok(files)
+}
+
+fn read_parse(path: &Path) -> Result<syn::File, RustLoadError> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| RustLoadError::Io(path.to_path_buf(), e))?;
+    syn::parse_file(&content).map_err(|e| RustLoadError::Parse(path.to_path_buf(), e))
 }
 
 /// Re-mangle overloaded exports to the long `..._method__<args>` form, matching
@@ -135,25 +181,7 @@ fn resolve_overloads(sigs: &mut [Signature]) {
     }
 }
 
-fn extract_file(path: &Path, arts: &mut RustArtifacts) -> Result<(), RustLoadError> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| RustLoadError::Io(path.to_path_buf(), e))?;
-    let file =
-        syn::parse_file(&content).map_err(|e| RustLoadError::Parse(path.to_path_buf(), e))?;
-    for item in &file.items {
-        let Item::Fn(f) = item else { continue };
-        if let Some(sig) = lower_fn(f, path) {
-            arts.natives.push(sig);
-        }
-    }
-    // Also recognize the jni 0.22.4 macros: native methods (`native_method! { }`,
-    // `bind_java_type! { native_methods { } }`) and the Rust→Java call bindings
-    // (`bind_java_type!`'s `methods`/`fields`/`constructors`).
-    macros::collect(&file, path, &mut arts.natives, &mut arts.java_refs);
-    Ok(())
-}
-
-fn lower_fn(f: &syn::ItemFn, path: &Path) -> Option<Signature> {
+fn lower_fn(f: &syn::ItemFn, path: &Path, reg: &TypeRegistry) -> Option<Signature> {
     let ident = f.sig.ident.to_string();
 
     // Two recognized fn shapes: a `#[jni_mangle("pkg.Class")]`-attributed fn
@@ -180,10 +208,10 @@ fn lower_fn(f: &syn::ItemFn, path: &Path) -> Option<Signature> {
         .get(1)
         .map(|t| receiver_kind(t))
         .unwrap_or(Receiver::Unknown);
-    let params: Vec<IrType> = inputs.iter().skip(2).map(|t| lower_type(t)).collect();
+    let params: Vec<IrType> = inputs.iter().skip(2).map(|t| lower_type(t, reg)).collect();
     let ret = match &f.sig.output {
         ReturnType::Default => IrType::Void,
-        ReturnType::Type(_, ty) => lower_type(ty),
+        ReturnType::Type(_, ty) => lower_type(ty, reg),
     };
 
     let (key, export_problem) = match &mangle {
@@ -339,8 +367,9 @@ fn receiver_kind(ty: &Type) -> Receiver {
     }
 }
 
-/// Lower a `syn::Type` to our IR.
-fn lower_type(ty: &Type) -> IrType {
+/// Lower a `syn::Type` to our IR. `reg` resolves user wrapper types declared with
+/// `bind_java_type!` to their Java class (see [`TypeRegistry`]).
+fn lower_type(ty: &Type, reg: &TypeRegistry) -> IrType {
     let Some((ident, args)) = path_ident_and_args(ty) else {
         return IrType::Unsupported(render(ty));
     };
@@ -362,7 +391,7 @@ fn lower_type(ty: &Type) -> IrType {
             }
         }
         "Option" => match first_type_arg(&args) {
-            Some(inner) => match lower_type(inner) {
+            Some(inner) => match lower_type(inner, reg) {
                 IrType::Pointer(mut p) => {
                     p.nullable = true;
                     IrType::Pointer(p)
@@ -371,9 +400,28 @@ fn lower_type(ty: &Type) -> IrType {
             },
             None => IrType::Unsupported(render(ty)),
         },
-        other => {
-            typemap::rust_simple_type(other).unwrap_or_else(|| IrType::Unsupported(render(ty)))
-        }
+        // Generic array wrappers: the element type lives in the generic arg, so
+        // (unlike the bare `JByteArray` aliases) they can't be mapped by name.
+        // `JPrimitiveArray<jint>` → `[I`, `JObjectArray<JString>` → `[Ljava/lang/String;`,
+        // `JObjectArray<JPose>` → `[Lexample/Pose;` for a `bind_java_type!`-bound `JPose`.
+        "JPrimitiveArray" | "JObjectArray" => match first_type_arg(&args) {
+            Some(inner) => typemap::array_of(&lower_type(inner, reg))
+                .unwrap_or_else(|| IrType::Unsupported(render(ty))),
+            // `JObjectArray`'s element type defaults to `JObject` when elided.
+            None if ident == "JObjectArray" => IrType::JavaObject {
+                class: "[Ljava/lang/Object;".to_owned(),
+            },
+            None => IrType::Unsupported(render(ty)),
+        },
+        // A built-in wrapper (`JString`, …), else a user wrapper type bound via
+        // `bind_java_type!`, else genuinely unsupported.
+        other => typemap::rust_simple_type(other)
+            .or_else(|| {
+                reg.get(other).map(|class| IrType::JavaObject {
+                    class: class.clone(),
+                })
+            })
+            .unwrap_or_else(|| IrType::Unsupported(render(ty))),
     }
 }
 
@@ -437,7 +485,7 @@ mod tests {
 
     fn lower_src(src: &str) -> Signature {
         let f: syn::ItemFn = syn::parse_str(src).unwrap();
-        lower_fn(&f, std::path::Path::new("lib.rs")).expect("fn lowered")
+        lower_fn(&f, std::path::Path::new("lib.rs"), &TypeRegistry::new()).expect("fn lowered")
     }
 
     #[test]
@@ -551,5 +599,67 @@ mod tests {
             "Java_example_MangleExample_lookup__Ljava_lang_String_2"
         );
         assert_eq!(sig.key.java_method, "lookup");
+    }
+
+    fn lower_ty(src: &str) -> IrType {
+        lower_ty_reg(src, &TypeRegistry::new())
+    }
+
+    fn lower_ty_reg(src: &str, reg: &TypeRegistry) -> IrType {
+        let ty: syn::Type = syn::parse_str(src).expect("type parses");
+        lower_type(&ty, reg)
+    }
+
+    #[test]
+    fn maps_generic_array_wrappers() {
+        let obj = |c: &str| IrType::JavaObject {
+            class: c.to_owned(),
+        };
+        // `JPrimitiveArray<T>` carries its element primitive: the mapping must
+        // read the generic arg, not just the `JPrimitiveArray` ident.
+        assert_eq!(lower_ty("JPrimitiveArray<'local, jint>"), obj("[I"));
+        assert_eq!(lower_ty("JPrimitiveArray<'local, jbyte>"), obj("[B"));
+        assert_eq!(lower_ty("JPrimitiveArray<'local, jdouble>"), obj("[D"));
+        // `JObjectArray<E>` carries its element class, not a blanket `Object[]`.
+        assert_eq!(
+            lower_ty("JObjectArray<'local, JString>"),
+            obj("[Ljava/lang/String;")
+        );
+        assert_eq!(
+            lower_ty("JObjectArray<'local, JObject>"),
+            obj("[Ljava/lang/Object;")
+        );
+        // Bare `JObjectArray` defaults to `Object[]` (jni's default element).
+        assert_eq!(lower_ty("JObjectArray<'local>"), obj("[Ljava/lang/Object;"));
+        // Nested arrays compose descriptor-wise.
+        assert_eq!(
+            lower_ty("JObjectArray<'local, JByteArray<'local>>"),
+            obj("[[B")
+        );
+    }
+
+    #[test]
+    fn object_types_resolve_via_bind_java_type_registry() {
+        // A user wrapper type declared with `bind_java_type! { JPose => "example.Pose" }`
+        // resolves to its Java class — both bare and as a `JObjectArray` element.
+        let reg = TypeRegistry::from([("JPose".to_owned(), "example/Pose".to_owned())]);
+        assert_eq!(
+            lower_ty_reg("JPose<'local>", &reg),
+            IrType::JavaObject {
+                class: "example/Pose".to_owned()
+            }
+        );
+        assert_eq!(
+            lower_ty_reg("JObjectArray<'local, JPose<'local>>", &reg),
+            IrType::JavaObject {
+                class: "[Lexample/Pose;".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn unregistered_object_type_is_unsupported() {
+        // With no registry entry, an unknown wrapper stays unsupported (unchanged).
+        assert!(matches!(lower_ty("JPose<'local>"), IrType::Unsupported(_)));
     }
 }
