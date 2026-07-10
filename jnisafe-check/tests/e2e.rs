@@ -8,6 +8,7 @@
 //!   pixi run fixtures
 //! If they are absent the tests fail with a message pointing here.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use jnisafe_check::cli::{Config, Format};
@@ -52,11 +53,22 @@ fn config(rust_crate: PathBuf, java: Vec<PathBuf>) -> Config {
     Config {
         rust_crate,
         java,
+        // Default to `$JAVA_HOME` so JDK stdlib bindings can be resolved; harmless
+        // for fixtures that reference no JDK types (no resolution is triggered).
+        java_home: std::env::var_os("JAVA_HOME").map(PathBuf::from),
         flow: false,
         format: Format::Human,
         quiet: true,
         verbose: false,
     }
+}
+
+/// A usable JDK home for the JDK-resolution tests: `$JAVA_HOME` if set and it
+/// contains a `jmods/` directory (a full JDK, as pixi provides). `None` under a
+/// bare `cargo test` with no JDK, so those tests skip rather than fail.
+fn jdk_home() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("JAVA_HOME")?);
+    home.join("jmods").is_dir().then_some(home)
 }
 
 /// The member a diagnostic pins to: the Java method/field it fires on when it
@@ -229,6 +241,54 @@ fn overloaded_macro_methods_match_when_supported() {
     assert!(
         !report.has_errors(),
         "overloaded macro natives should match their Java declarations:\n{report}"
+    );
+}
+
+#[test]
+fn array_wrappers_match_their_java_declarations() {
+    // Array-typed natives bound through the generic jni wrappers
+    // (`JPrimitiveArray<T>` / `JObjectArray<E>`, incl. the default `Object`
+    // element and a nested `byte[][]`) must map to the same descriptors as their
+    // Java `int[]` / `String[]` / `Object[]` / `byte[][]` declarations, so every
+    // method pairs cleanly with no diagnostics.
+    let cfg = config(
+        fixture("tests/fixtures/arrays"),
+        vec![class("example/Arrays.class")],
+    );
+    let report = run(&cfg).expect("run");
+    assert!(
+        !report.has_errors(),
+        "array-typed natives should match their Java declarations:\n{report}"
+    );
+    assert_eq!(
+        report.diagnostics.len(),
+        0,
+        "unexpected findings:\n{report}"
+    );
+}
+
+#[test]
+fn object_array_of_bound_type_matches() {
+    // A native returns/takes `Pose[]`, whose Rust element type `JPose` is a user
+    // wrapper bound via `bind_java_type! { JPose => "example.Pose" }`. The checker
+    // must resolve `JObjectArray<'local, JPose<'local>>` to `[Lexample/Pose;` and
+    // match cleanly — element types aren't limited to built-ins like `JString`.
+    let cfg = config(
+        fixture("tests/fixtures/object_arrays"),
+        vec![
+            class("example/ObjectArrays.class"),
+            class("example/Pose.class"),
+        ],
+    );
+    let report = run(&cfg).expect("run");
+    assert!(
+        !report.has_errors(),
+        "object-array natives with a bound element type should match:\n{report}"
+    );
+    assert_eq!(
+        report.diagnostics.len(),
+        0,
+        "unexpected findings:\n{report}"
     );
 }
 
@@ -495,4 +555,93 @@ fn flow_lowers_bytecode() {
         code.insns.iter().any(|i| i.line.is_some()),
         "expected a line-number mapping"
     );
+}
+
+// ---- JDK stdlib resolution (--java-home) ----------------------------------
+//
+// Binding to a JDK type (e.g. `java.nio.ByteBuffer`) that is not passed on
+// `--java`: the checker resolves the class (and its supertype closure) from the
+// JDK pointed to by `--java-home`/`$JAVA_HOME`. These tests skip when no full
+// JDK is available (bare `cargo test`); `pixi run test` always provides one.
+
+/// `load_jdk_models` resolves a referenced JDK class *and* its transitive
+/// supertype closure, recording each class's superclass link.
+#[test]
+fn load_jdk_models_resolves_bytebuffer_and_supertypes() {
+    let Some(home) = jdk_home() else {
+        eprintln!("skipping: no JDK with jmods/ at $JAVA_HOME");
+        return;
+    };
+    let seeds: HashSet<String> = ["java/nio/ByteBuffer".to_owned()].into_iter().collect();
+    let models = java_loader::load_jdk_models(&home, &seeds, &HashSet::new()).expect("load jdk");
+
+    let names: HashSet<&str> = models.iter().map(|m| m.internal_name.as_str()).collect();
+    assert!(
+        names.contains("java/nio/ByteBuffer"),
+        "seed resolved: {names:?}"
+    );
+    assert!(
+        names.contains("java/nio/Buffer"),
+        "superclass closure: {names:?}"
+    );
+    assert!(
+        names.contains("java/lang/Object"),
+        "root of chain: {names:?}"
+    );
+
+    let bb = models
+        .iter()
+        .find(|m| m.internal_name == "java/nio/ByteBuffer")
+        .unwrap();
+    assert_eq!(bb.super_class.as_deref(), Some("java/nio/Buffer"));
+}
+
+/// A JDK home with no `jmods/` (and no `rt.jar`) resolves nothing rather than
+/// erroring — the caller falls back to W004.
+#[test]
+fn load_jdk_models_without_jdk_source_is_graceful() {
+    let seeds: HashSet<String> = ["java/nio/ByteBuffer".to_owned()].into_iter().collect();
+    // The crate root is not a JDK: no jmods/, no rt.jar.
+    let models = java_loader::load_jdk_models(&root(), &seeds, &HashSet::new()).expect("graceful");
+    assert!(models.is_empty(), "no JDK source should resolve nothing");
+}
+
+/// `bind_java_type!` to members **declared on** `java.nio.ByteBuffer` verifies
+/// cleanly once the class is resolved from the JDK (PR-A).
+#[test]
+fn jdk_declared_members_verify() {
+    if jdk_home().is_none() {
+        eprintln!("skipping: no JDK with jmods/ at $JAVA_HOME");
+        return;
+    }
+    // No `--java` classes: the bound `java.nio.ByteBuffer` comes purely from the JDK.
+    let cfg = config(fixture("tests/fixtures/jdk_declared"), vec![]);
+    let report = run(&cfg).expect("run");
+    assert_findings!(report);
+}
+
+/// A binding to a method that exists nowhere in ByteBuffer's hierarchy is a hard
+/// E040 (the class is resolved, so it is *not* W004).
+#[test]
+fn jdk_missing_member_reports_e040() {
+    if jdk_home().is_none() {
+        eprintln!("skipping: no JDK with jmods/ at $JAVA_HOME");
+        return;
+    }
+    let cfg = config(fixture("tests/fixtures/jdk_missing"), vec![]);
+    let report = run(&cfg).expect("run");
+    assert_findings!(report, "E040" @ "java.nio.ByteBuffer.ghostMethod");
+}
+
+/// `bind_java_type!` to members **inherited from `java.nio.Buffer`** verifies
+/// cleanly only once member lookup walks the superclass chain (PR-B).
+#[test]
+fn jdk_inherited_members_verify() {
+    if jdk_home().is_none() {
+        eprintln!("skipping: no JDK with jmods/ at $JAVA_HOME");
+        return;
+    }
+    let cfg = config(fixture("tests/fixtures/jdk_inherited"), vec![]);
+    let report = run(&cfg).expect("run");
+    assert_findings!(report);
 }

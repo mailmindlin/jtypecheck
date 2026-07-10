@@ -59,7 +59,7 @@ cmd = "mvn -B -f jnisafe-annotations/pom.xml -Prelease clean deploy"
 # All are `package example;`, so they land together in classes/example/.
 # Run this whenever the example or fixture Java changes (`pixi run test` does).
 [tasks.fixtures]
-cmd = "javac -g -cp build/annotations/classes -d jnisafe-check/tests/fixtures/classes example/java/example/*.java jnisafe-check/tests/fixtures/incorrect/*.java jnisafe-check/tests/fixtures/incorrect_macros/*.java jnisafe-check/tests/fixtures/incorrect_calls/*.java jnisafe-check/tests/fixtures/field_handles/*.java jnisafe-check/tests/fixtures/flow/*.java"
+cmd = "javac -g -cp build/annotations/classes -d jnisafe-check/tests/fixtures/classes example/java/example/*.java jnisafe-check/tests/fixtures/incorrect/*.java jnisafe-check/tests/fixtures/incorrect_macros/*.java jnisafe-check/tests/fixtures/incorrect_calls/*.java jnisafe-check/tests/fixtures/field_handles/*.java jnisafe-check/tests/fixtures/flow/*.java jnisafe-check/tests/fixtures/arrays/*.java jnisafe-check/tests/fixtures/object_arrays/*.java"
 depends-on = ["compile-annotations"]
 inputs = [
   "example/java/example/*.java",
@@ -68,6 +68,8 @@ inputs = [
   "jnisafe-check/tests/fixtures/incorrect_calls/*.java",
   "jnisafe-check/tests/fixtures/field_handles/*.java",
   "jnisafe-check/tests/fixtures/flow/*.java",
+  "jnisafe-check/tests/fixtures/arrays/*.java",
+  "jnisafe-check/tests/fixtures/object_arrays/*.java",
   "build/annotations/classes/**/*.class",
 ]
 outputs = ["jnisafe-check/tests/fixtures/classes/example/*.class"]
