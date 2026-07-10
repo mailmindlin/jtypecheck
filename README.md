@@ -107,6 +107,14 @@ you keep the static check whichever style you adopt:
   descriptor from your signatures so the two overloads pair up cleanly. See
   [`overloaded.rs`](example/rust/src/overloaded.rs).
 
+* **Custom object types.** Built-in wrappers (`JString`, `JObject`, `JByteBuffer`,
+  …) map to their Java class automatically. A *user* wrapper type gets its class
+  from the `bind_java_type! { pub JPose => "com.example.Pose", … }` header, so it
+  resolves wherever it appears in a native signature — as a bare parameter/return
+  **or** as a `JObjectArray` element: `JObjectArray<'local, JPose<'local>>` checks
+  against a Java `Pose[]` (`[Lcom/example/Pose;`). Resolution is independent of
+  which file declares the binding.
+
 * **`bind_java_type! { methods { … } fields { … } constructors { … } }`** — the
   *Rust→Java* direction: these clauses generate type-safe wrappers that call
   into Java. The checker verifies each named method/field/constructor exists on
@@ -139,6 +147,14 @@ jnisafe-check \
 `--java` accepts a `.class` file, a directory of classes, or a `.jar`, and is repeatable.
 Add `[--format human|json]` and `[--quiet]` to control output.
 Exit codes: **0** clean, **1** mismatches found, **3** internal error.
+
+**Binding to JDK stdlib types.** When a `bind_java_type!` binding targets a JDK
+class you don't pass on `--java` (e.g. `java.nio.ByteBuffer`), point the checker at
+a JDK with `--java-home` (it defaults to `$JAVA_HOME`). The referenced classes and
+their supertypes are resolved from the JDK's `jmods/` (Java 9+) or `rt.jar`
+(Java 8) — so inherited members are checked too — which needs a **full JDK, not a
+JRE**. Without a usable JDK home, such bindings can't be verified and are reported
+as **W004** instead.
 
 Wire this into CI to catch signature/ownership drift before it becomes a runtime crash.
 
