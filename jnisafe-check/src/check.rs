@@ -176,17 +176,46 @@ pub fn check_java_refs(refs: &[JavaRef], models: &[JavaClassModel], report: &mut
                 )
                 .with_rust(Some(r.origin.clone()))
                 .help(
-                    "pass that class (or its containing dir/jar) on --java to check this binding",
+                    "pass that class (or its containing dir/jar) on --java — or, for a JDK stdlib type, set --java-home/$JAVA_HOME to a full JDK — to check this binding",
                 ),
             );
             continue;
         };
         match r.kind {
-            JavaRefKind::Method => check_method_ref(r, model, report),
+            // Methods and fields are inherited, so resolve against the class *and*
+            // its supertype chain. Constructors are not inherited.
+            JavaRefKind::Method => {
+                check_method_ref(r, &hierarchy(&r.class_internal, &index), report)
+            }
             JavaRefKind::Constructor => check_ctor_ref(r, model, report),
-            JavaRefKind::Field => check_field_ref(r, model, report),
+            JavaRefKind::Field => check_field_ref(r, &hierarchy(&r.class_internal, &index), report),
         }
     }
+}
+
+/// The class named `start` together with all its resolvable supertypes
+/// (superclasses and interfaces, transitively), self first. Links absent from
+/// `index` are silently skipped — lookup then falls back to whatever *is*
+/// resolvable (a superclass we couldn't load can't be walked).
+fn hierarchy<'a>(
+    start: &str,
+    index: &HashMap<&str, &'a JavaClassModel>,
+) -> Vec<&'a JavaClassModel> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue = vec![start.to_owned()];
+    while let Some(name) = queue.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(m) = index.get(name.as_str()).copied() else {
+            continue;
+        };
+        out.push(m);
+        queue.extend(m.super_class.clone());
+        queue.extend(m.interfaces.iter().cloned());
+    }
+    out
 }
 
 /// The expected return descriptor for a `JavaRef` method (`"V"` for void).
@@ -197,11 +226,11 @@ fn expected_ret(ret: &IrType) -> Option<String> {
     }
 }
 
-fn check_method_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
+fn check_method_ref(r: &JavaRef, hierarchy: &[&JavaClassModel], report: &mut Report) {
     let class = r.class_internal.replace('/', ".");
-    let by_name: Vec<&JavaMethodSig> = model
-        .methods
+    let by_name: Vec<&JavaMethodSig> = hierarchy
         .iter()
+        .flat_map(|m| m.methods.iter())
         .filter(|m| m.name == r.java_name)
         .collect();
     if by_name.is_empty() {
@@ -292,11 +321,11 @@ fn check_ctor_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
     );
 }
 
-fn check_field_ref(r: &JavaRef, model: &JavaClassModel, report: &mut Report) {
+fn check_field_ref(r: &JavaRef, hierarchy: &[&JavaClassModel], report: &mut Report) {
     let class = r.class_internal.replace('/', ".");
-    let by_name: Vec<&JavaFieldSig> = model
-        .fields
+    let by_name: Vec<&JavaFieldSig> = hierarchy
         .iter()
+        .flat_map(|m| m.fields.iter())
         .filter(|f| f.name == r.java_name)
         .collect();
     if by_name.is_empty() {
@@ -622,10 +651,11 @@ fn compare(
 
 fn nullability_desc(nullable: bool) -> String {
     if nullable {
-        "nullable (Java default / Rust `Option<..>`)".to_owned()
+        "nullable (Java default / Rust `Option<..>`)"
     } else {
-        "non-nullable (Java `nullable=false` / bare Rust wrapper)".to_owned()
+        "non-nullable (Java `nullable=false` / bare Rust wrapper)"
     }
+    .to_owned()
 }
 
 #[cfg(test)]
@@ -686,6 +716,8 @@ mod tests {
     fn model() -> JavaClassModel {
         JavaClassModel {
             internal_name: "example/Foo".to_owned(),
+            super_class: Some("java/lang/Object".to_owned()),
+            interfaces: Vec::new(),
             methods: vec![JavaMethodSig {
                 name: "doubled".to_owned(),
                 is_static: true,
@@ -869,6 +901,8 @@ mod tests {
     fn handle_model(annotation: Option<Pointer>) -> JavaClassModel {
         JavaClassModel {
             internal_name: "example/Foo".to_owned(),
+            super_class: Some("java/lang/Object".to_owned()),
+            interfaces: Vec::new(),
             methods: vec![],
             fields: vec![JavaFieldSig {
                 name: "handle".to_owned(),

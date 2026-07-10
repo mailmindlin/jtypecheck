@@ -263,6 +263,12 @@ pub struct JavaRef {
 pub struct JavaClassModel {
     /// Internal binary name, e.g. `example/BindTypeExample`.
     pub internal_name: String,
+    /// Superclass internal name, e.g. `java/nio/Buffer`. `None` only for
+    /// `java/lang/Object` and interfaces/module-info. Drives inherited-member
+    /// lookup and the JDK supertype closure.
+    pub super_class: Option<String>,
+    /// Directly-implemented interface internal names.
+    pub interfaces: Vec<String>,
     pub methods: Vec<JavaMethodSig>,
     pub fields: Vec<JavaFieldSig>,
     /// `<init>` argument descriptors, e.g. `"I"` for a `(int)` constructor.

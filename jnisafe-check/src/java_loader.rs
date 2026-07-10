@@ -1,7 +1,7 @@
 //! Java front-end: read `.class` / `.jar` with cafebabe and lower native
 //! methods (plus their `@Ref`/`@Mut`/`@Owned` type annotations) into [`Signature`]s.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,9 @@ use cafebabe::attributes::{
 };
 use cafebabe::bytecode::Opcode;
 use cafebabe::descriptors::{FieldDescriptor, FieldType, MethodDescriptor, ReturnDescriptor};
-use cafebabe::{FieldAccessFlags, MethodAccessFlags, parse_class};
+use cafebabe::{
+    FieldAccessFlags, MethodAccessFlags, ParseOptions, parse_class, parse_class_with_options,
+};
 
 use crate::code::{
     self, ExceptionRange, Insn, LocalHandleAnn, LocalName, MemberRef, MethodCode, Op, ParamInfo,
@@ -56,6 +58,61 @@ pub fn load_models(paths: &[PathBuf]) -> Result<Vec<JavaClassModel>, JavaLoadErr
         models.push(build_model(class));
         Ok(())
     })?;
+    Ok(models)
+}
+
+/// Resolve the JDK classes named by `seeds` (internal binary names) **and their
+/// transitive supertype closure** into [`JavaClassModel`]s, reading class bytes
+/// from the JDK at `java_home` (its `jmods/` or Java 8 `rt.jar`). Classes in
+/// `already_loaded` (those provided on `--java`) are skipped and stop the
+/// closure. Returns an empty vec when `java_home` has no usable class source, so
+/// the caller falls back to W004 rather than failing.
+///
+/// Only method/field/constructor *signatures* are needed, so bytecode parsing is
+/// switched off — this keeps resolving a handful of stdlib classes cheap.
+pub fn load_jdk_models(
+    java_home: &Path,
+    seeds: &HashSet<String>,
+    already_loaded: &HashSet<String>,
+) -> Result<Vec<JavaClassModel>, JavaLoadError> {
+    let Some(mut resolver) = crate::jdk::JdkResolver::open(java_home) else {
+        return Ok(Vec::new());
+    };
+
+    let mut opts = ParseOptions::default();
+    opts.parse_bytecode(false);
+
+    let mut models = Vec::new();
+    let mut visited: HashSet<String> = already_loaded.clone();
+    let mut queue: Vec<String> = Vec::new();
+    for s in seeds {
+        if visited.insert(s.clone()) {
+            queue.push(s.clone());
+        }
+    }
+
+    while let Some(name) = queue.pop() {
+        let Some(bytes) = resolver.class_bytes(&name) else {
+            continue; // absent from the JDK (e.g. a missing user class) — leave to W004
+        };
+        let Ok(class) = parse_class_with_options(&bytes, &opts) else {
+            continue;
+        };
+        let model = build_model(&class);
+        // Pull in not-yet-seen supertypes so inherited members resolve too.
+        if let Some(sup) = &model.super_class
+            && visited.insert(sup.clone())
+        {
+            queue.push(sup.clone());
+        }
+        for i in &model.interfaces {
+            if visited.insert(i.clone()) {
+                queue.push(i.clone());
+            }
+        }
+        models.push(model);
+    }
+
     Ok(models)
 }
 
@@ -148,6 +205,8 @@ fn build_model(class: &cafebabe::ClassFile) -> JavaClassModel {
         .collect();
     JavaClassModel {
         internal_name: class.this_class.to_string(),
+        super_class: class.super_class.as_ref().map(|c| c.to_string()),
+        interfaces: class.interfaces.iter().map(|i| i.to_string()).collect(),
         methods,
         fields,
         constructors,

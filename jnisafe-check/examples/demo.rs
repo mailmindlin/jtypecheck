@@ -27,6 +27,7 @@ fn config(rust_crate: &str, java: &[&str]) -> Config {
     Config {
         rust_crate: PathBuf::from(rust_crate),
         java: java.iter().map(PathBuf::from).collect(),
+        java_home: std::env::var_os("JAVA_HOME").map(PathBuf::from),
         flow: false,
         format: Format::Human,
         quiet: true,

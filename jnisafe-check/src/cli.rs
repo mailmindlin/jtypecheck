@@ -28,6 +28,14 @@ pub struct Config {
     #[arg(long = "java", required = true, num_args = 1..)]
     pub java: Vec<PathBuf>,
 
+    /// A JDK home (e.g. `$JAVA_HOME`), used to resolve JDK stdlib classes that a
+    /// `bind_java_type!` binding references but that are not passed on `--java`
+    /// (e.g. `java.nio.ByteBuffer`). Needs a full JDK — its `jmods/` (Java 9+) or
+    /// `rt.jar` (Java 8) — not a JRE. Defaults to the `JAVA_HOME` environment
+    /// variable; if neither is set, such bindings can't be verified (W004).
+    #[arg(long)]
+    pub java_home: Option<PathBuf>,
+
     /// Also run the Java-side handle-flow analysis (leaks, use-after-move,
     /// forging, wrong-type, exposure, …) over the method bodies. Off by default:
     /// it is intraprocedural and can flag legitimate-but-unannotated handle
@@ -46,4 +54,14 @@ pub struct Config {
     /// Dump the extracted IR for both sides before checking.
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+impl Config {
+    /// The effective JDK home for resolving stdlib classes: the `--java-home`
+    /// flag if given, else the `JAVA_HOME` environment variable, else `None`.
+    pub fn effective_java_home(&self) -> Option<PathBuf> {
+        self.java_home
+            .clone()
+            .or_else(|| std::env::var_os("JAVA_HOME").map(PathBuf::from))
+    }
 }
